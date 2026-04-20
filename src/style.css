@@ -1,0 +1,47 @@
+/* Global baseline — all meaningful styles live in Custom Element Shadow DOMs */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  /* Color tokens */
+  --ls-color-bg: #1a1a2e;
+  --ls-color-bg-subtle: #111122;
+  --ls-color-bg-elevated: #242438;
+  --ls-color-fg: #e0e0e0;
+  --ls-color-fg-subtle: #aaaaaa;
+  --ls-color-border: #333355;
+  --ls-color-accent: #7c6af7;
+  --ls-color-accent-hover: #9585fa;
+
+  /* Typography */
+  --ls-font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ls-font-mono: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+  --ls-font-size-base: 14px;
+  --ls-line-height-base: 1.6;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html, body {
+  height: 100%;
+  font-family: var(--ls-font-ui);
+  font-size: var(--ls-font-size-base);
+  background: var(--ls-color-bg);
+  color: var(--ls-color-fg);
+  line-height: var(--ls-line-height-base);
+}
+
+a {
+  color: var(--ls-color-accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}

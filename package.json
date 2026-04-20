@@ -1,0 +1,37 @@
+{
+  "name": "lemonstone",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@vitest/coverage-v8": "^4.1.4",
+    "happy-dom": "^20.9.0",
+    "playwright": "^1.59.1",
+    "typescript": "~5.6.2",
+    "vite": "^5.4.10",
+    "vitest": "^4.1.4",
+    "workbox-cli": "^7.4.0"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-markdown": "^6.5.0",
+    "@codemirror/language": "^6.12.3",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.41.1",
+    "@isomorphic-git/lightning-fs": "^4.6.2",
+    "codemirror": "^6.0.2",
+    "idb": "^8.0.3",
+    "isomorphic-git": "^1.37.5",
+    "minisearch": "^7.2.0"
+  }
+}
