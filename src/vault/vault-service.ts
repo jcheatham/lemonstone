@@ -399,6 +399,16 @@ export class VaultService extends EventTarget {
     await this.storage.writeIndexesSnapshot(bytes, "");
   }
 
+  // ── Sync API ────────────────────────────────────────────────────────────────
+
+  async sync(): Promise<void> {
+    await this.syncClient.call("sync");
+  }
+
+  async resolveConflict(path: string): Promise<void> {
+    await this.syncClient.call("resolveConflict", { path });
+  }
+
   // ── Private: sync ───────────────────────────────────────────────────────────
 
   private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
