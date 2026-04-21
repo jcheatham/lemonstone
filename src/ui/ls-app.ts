@@ -4,7 +4,7 @@
 //   <ls-file-tree>, <ls-editor>, <ls-backlinks>, <ls-outline>,
 //   <ls-command-palette>, <ls-switcher>, hash router, vaultService.
 
-import { isAuthenticated, clearTokens } from "../auth/index.ts";
+import { isAuthenticated, loadTokens } from "../auth/index.ts";
 import { vaultService } from "../vault/index.ts";
 import { currentRoute, navigateTo, navigateHome } from "./router.ts";
 import type { Route } from "./router.ts";
@@ -184,6 +184,7 @@ export class LSApp extends HTMLElement {
   #editorWrap!: HTMLElement;
   #statusDot!: HTMLElement;
   #statusText!: HTMLElement;
+  #repoLabel!: HTMLAnchorElement;
   #conflictBanner!: HTMLElement;
   #fileTree!: LSFileTree;
   #backlinks!: LSBacklinks;
@@ -349,15 +350,23 @@ export class LSApp extends HTMLElement {
     this.#statusDot.className = "status-dot";
     this.#statusText = document.createElement("span");
     this.#statusText.textContent = "Ready";
+    this.#repoLabel = document.createElement("a");
+    this.#repoLabel.style.cssText =
+      "margin-left:auto;color:var(--ls-color-fg-muted,#64748b);font-size:11px;" +
+      "text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" +
+      "max-width:200px;";
+    this.#repoLabel.target = "_blank";
+    this.#repoLabel.rel = "noopener noreferrer";
+
     const signOutBtn = document.createElement("button");
     signOutBtn.textContent = "Sign out";
     signOutBtn.style.cssText =
-      "margin-left:auto;background:none;border:none;color:var(--ls-color-fg-muted,#64748b);" +
-      "font-size:11px;font-family:inherit;cursor:pointer;padding:0 4px;";
+      "margin-left:8px;background:none;border:none;color:var(--ls-color-fg-muted,#64748b);" +
+      "font-size:11px;font-family:inherit;cursor:pointer;padding:0 4px;flex-shrink:0;";
     signOutBtn.addEventListener("mouseenter", () => { signOutBtn.style.color = "var(--ls-color-fg,#e0e0e0)"; });
     signOutBtn.addEventListener("mouseleave", () => { signOutBtn.style.color = "var(--ls-color-fg-muted,#64748b)"; });
     signOutBtn.addEventListener("click", () => this.#signOut());
-    statusBar.append(this.#statusDot, this.#statusText, signOutBtn);
+    statusBar.append(this.#statusDot, this.#statusText, this.#repoLabel, signOutBtn);
     main.appendChild(statusBar);
 
     // Auth overlay
@@ -427,20 +436,31 @@ export class LSApp extends HTMLElement {
       this.#authOverlay.classList.add("visible");
       return;
     }
+    const tokens = await loadTokens();
+    if (tokens) this.#setRepoLabel(tokens.repoFullName);
     // Tokens exist — kick off a sync (auto-clones on first run).
     vaultService.sync().catch(console.error);
     await this.#loadNoteList();
     await this.#handleRoute(currentRoute());
   }
 
+  async #setRepoLabel(repoFullName: string): Promise<void> {
+    this.#repoLabel.textContent = repoFullName;
+    this.#repoLabel.href = `https://github.com/${repoFullName}`;
+  }
+
   async #postAuthInit(): Promise<void> {
+    const tokens = await loadTokens();
+    if (tokens) this.#setRepoLabel(tokens.repoFullName);
+
     this.#setStatus("syncing", "Cloning repository…");
     try {
       await vaultService.clone();
     } catch (err) {
-      // An empty repo has nothing to clone; not fatal.
       console.warn("Clone skipped or failed:", err);
     }
+    // Sync ensures IndexedDB is populated even if clone was a no-op.
+    vaultService.sync().catch(console.error);
     this.#setStatus("ok", "Ready");
     await this.#loadNoteList();
     await this.#handleRoute(currentRoute());
@@ -603,7 +623,19 @@ export class LSApp extends HTMLElement {
 
   async #signOut(): Promise<void> {
     if (!confirm("Sign out and clear stored credentials?")) return;
-    await clearTokens();
+    // Wipe the OPFS git cache so the next sign-in always does a fresh clone.
+    if (typeof navigator?.storage?.getDirectory === "function") {
+      try {
+        const root = await navigator.storage.getDirectory();
+        await root.removeEntry("lemonstone-git", { recursive: true });
+      } catch { /* directory may not exist yet */ }
+    }
+    // Deleting the whole DB removes tokens, notes, and stale records in one shot.
+    // The request is async but the reload will wait for it to settle.
+    await new Promise<void>(resolve => {
+      const req = indexedDB.deleteDatabase("lemonstone-vault");
+      req.onsuccess = req.onerror = req.onblocked = () => resolve();
+    });
     location.reload();
   }
 

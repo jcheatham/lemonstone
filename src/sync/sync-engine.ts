@@ -152,8 +152,8 @@ export class SyncEngine {
 
     // 1. Fetch latest from origin. An empty remote has no refs — that's fine.
     let remoteIsEmpty = false;
+    console.log("[sync] fetching from origin, branch:", branch, "proxy:", GIT_CORS_PROXY);
     try {
-      console.log("[sync] fetching from origin, branch:", branch, "proxy:", GIT_CORS_PROXY);
       await git.fetch({
         fs: this.fs,
         http,
@@ -163,13 +163,29 @@ export class SyncEngine {
         remoteRef: branch,
         headers: authHeaders,
       });
-      // Confirm the remote ref actually landed after fetch.
-      await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: `origin/${branch}` });
-      console.log("[sync] fetch complete, remote ref exists");
     } catch (fetchErr) {
-      console.warn("[sync] fetch failed (treating as empty remote):", fetchErr);
-      // Fetch failed or remote ref missing — treat as empty remote.
+      const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      // "Could not find HEAD" = our local git state is broken (git.init was done
+      // but no commits exist yet and isomorphic-git can't resolve HEAD internally).
+      // Rethrow so the caller sees a real error instead of silently treating a
+      // corrupted local repo as an empty remote and making things worse.
+      if (msg.includes("Could not find HEAD")) {
+        console.error("[sync] broken local git state:", fetchErr);
+        throw fetchErr;
+      }
+      console.warn("[sync] fetch failed:", fetchErr);
       remoteIsEmpty = true;
+    }
+
+    // Confirm the remote ref actually landed after a successful fetch.
+    if (!remoteIsEmpty) {
+      try {
+        await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: `origin/${branch}` });
+        console.log("[sync] fetch complete, remote ref exists");
+      } catch {
+        console.warn("[sync] remote ref not found after fetch, treating remote as empty");
+        remoteIsEmpty = true;
+      }
     }
 
     // 2. Stage all dirty files from IndexedDB into the OPFS working tree.
