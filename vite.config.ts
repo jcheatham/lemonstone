@@ -13,10 +13,23 @@ function getBuildSha(): string {
   }
 }
 
+function getBuildRepo(): string {
+  // GitHub Actions sets GITHUB_REPOSITORY as "owner/repo".
+  const envRepo = process.env["GITHUB_REPOSITORY"];
+  if (envRepo) return envRepo;
+  try {
+    const url = execSync("git config --get remote.origin.url").toString().trim();
+    const match = url.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/);
+    if (match) return match[1]!;
+  } catch { /* no remote */ }
+  return "";
+}
+
 export default defineConfig({
   base: process.env["GITHUB_ACTIONS"] ? "/lemonstone/" : "/",
   define: {
     __BUILD_SHA__: JSON.stringify(getBuildSha()),
+    __BUILD_REPO__: JSON.stringify(getBuildRepo()),
   },
   resolve: {
     alias: {

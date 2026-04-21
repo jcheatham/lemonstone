@@ -185,7 +185,7 @@ export class LSApp extends HTMLElement {
   #editorWrap!: HTMLElement;
   #statusDot!: HTMLElement;
   #statusText!: HTMLElement;
-  #repoLabel!: HTMLAnchorElement;
+  #repoLabel!: HTMLElement;
   #conflictBanner!: HTMLElement;
   #fileTree!: LSFileTree;
   #backlinks!: LSBacklinks;
@@ -351,20 +351,23 @@ export class LSApp extends HTMLElement {
     this.#statusDot.className = "status-dot";
     this.#statusText = document.createElement("span");
     this.#statusText.textContent = "Ready";
-    const buildLabel = document.createElement("span");
-    buildLabel.textContent = `build ${__BUILD_SHA__}`;
-    buildLabel.title = "Deployed build SHA";
-    buildLabel.style.cssText =
-      "margin-left:auto;color:var(--ls-color-fg-muted,#64748b);font-size:11px;" +
-      "font-family:var(--ls-font-mono,monospace);";
+    const mutedLinkCss =
+      "color:var(--ls-color-fg-muted,#64748b);font-size:11px;text-decoration:none;" +
+      "font-family:var(--ls-font-mono,monospace);white-space:nowrap;";
 
-    this.#repoLabel = document.createElement("a");
+    const buildLabel = document.createElement("a");
+    buildLabel.textContent = `build ${__BUILD_SHA__}`;
+    buildLabel.title = "Source commit for this build";
+    buildLabel.target = "_blank";
+    buildLabel.rel = "noopener noreferrer";
+    buildLabel.style.cssText = `margin-left:auto;${mutedLinkCss}`;
+    if (__BUILD_REPO__ && __BUILD_SHA__ !== "dev") {
+      buildLabel.href = `https://github.com/${__BUILD_REPO__}/commit/${__BUILD_SHA__}`;
+    }
+
+    this.#repoLabel = document.createElement("span");
     this.#repoLabel.style.cssText =
-      "margin-left:12px;color:var(--ls-color-fg-muted,#64748b);font-size:11px;" +
-      "text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" +
-      "max-width:200px;";
-    this.#repoLabel.target = "_blank";
-    this.#repoLabel.rel = "noopener noreferrer";
+      `margin-left:12px;${mutedLinkCss}overflow:hidden;text-overflow:ellipsis;max-width:240px;`;
 
     const signOutBtn = document.createElement("button");
     signOutBtn.textContent = "Sign out";
@@ -456,18 +459,28 @@ export class LSApp extends HTMLElement {
   #currentSha = "";
 
   #renderRepoLabel(): void {
-    if (!this.#currentRepo) {
-      this.#repoLabel.textContent = "";
-      this.#repoLabel.removeAttribute("href");
-      return;
+    this.#repoLabel.replaceChildren();
+    if (!this.#currentRepo) return;
+
+    const repoLink = document.createElement("a");
+    repoLink.textContent = this.#currentRepo;
+    repoLink.href = `https://github.com/${this.#currentRepo}`;
+    repoLink.target = "_blank";
+    repoLink.rel = "noopener noreferrer";
+    repoLink.style.cssText = "color:inherit;text-decoration:none;";
+    this.#repoLabel.appendChild(repoLink);
+
+    if (this.#currentSha) {
+      const sep = document.createTextNode("#");
+      const shaLink = document.createElement("a");
+      shaLink.textContent = this.#currentSha.slice(0, 7);
+      shaLink.href = `https://github.com/${this.#currentRepo}/commit/${this.#currentSha}`;
+      shaLink.target = "_blank";
+      shaLink.rel = "noopener noreferrer";
+      shaLink.title = "Last synced commit";
+      shaLink.style.cssText = "color:inherit;text-decoration:none;";
+      this.#repoLabel.append(sep, shaLink);
     }
-    const short = this.#currentSha ? this.#currentSha.slice(0, 7) : "";
-    this.#repoLabel.textContent = short
-      ? `${this.#currentRepo}#${short}`
-      : this.#currentRepo;
-    this.#repoLabel.href = this.#currentSha
-      ? `https://github.com/${this.#currentRepo}/commit/${this.#currentSha}`
-      : `https://github.com/${this.#currentRepo}`;
   }
 
   #setRepoLabel(repoFullName: string): void {
