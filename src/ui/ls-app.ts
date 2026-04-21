@@ -6,6 +6,7 @@
 
 import { isAuthenticated, loadTokens } from "../auth/index.ts";
 import { vaultService } from "../vault/index.ts";
+import { getDB } from "../storage/db.ts";
 import { currentRoute, navigateTo, navigateHome } from "./router.ts";
 import type { Route } from "./router.ts";
 import { parseHeadings } from "./ls-outline.ts";
@@ -623,6 +624,7 @@ export class LSApp extends HTMLElement {
 
   async #signOut(): Promise<void> {
     if (!confirm("Sign out and clear stored credentials?")) return;
+    this.#setStatus("syncing", "Signing out…");
     // Wipe the OPFS git cache so the next sign-in always does a fresh clone.
     if (typeof navigator?.storage?.getDirectory === "function") {
       try {
@@ -630,12 +632,21 @@ export class LSApp extends HTMLElement {
         await root.removeEntry("lemonstone-git", { recursive: true });
       } catch { /* directory may not exist yet */ }
     }
-    // Deleting the whole DB removes tokens, notes, and stale records in one shot.
-    // The request is async but the reload will wait for it to settle.
-    await new Promise<void>(resolve => {
-      const req = indexedDB.deleteDatabase("lemonstone-vault");
-      req.onsuccess = req.onerror = req.onblocked = () => resolve();
-    });
+    // Clear each object store individually — deleteDatabase would block because
+    // the idb library holds an open connection that never explicitly closes.
+    try {
+      const db = await getDB();
+      await Promise.all([
+        db.clear("auth"),
+        db.clear("notes"),
+        db.clear("canvas"),
+        db.clear("attachments"),
+        db.clear("indexes-snapshot"),
+        db.clear("config"),
+      ]);
+    } catch (err) {
+      console.error("Failed to clear local DB:", err);
+    }
     location.reload();
   }
 

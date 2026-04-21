@@ -103,9 +103,19 @@ export class SyncEngine {
         depth: 50, // shallow clone for initial speed
         headers: this.makeAuthHeaders(tokens),
       });
-    } catch {
-      // Clone failed — almost certainly an empty repo with no commits.
-      // Bootstrap locally: init + configure remote so sync can push the first commit.
+    } catch (cloneErr) {
+      const msg = cloneErr instanceof Error ? cloneErr.message : String(cloneErr);
+      // Re-throw hard errors (auth, repo not found, network) so the caller knows
+      // something is genuinely wrong. Only fall back to a local init for the
+      // "empty repo has no refs" case where clone fails because there's nothing to clone.
+      if (msg.includes("401") || msg.includes("403") || msg.includes("404") || msg.includes("HTTP Error")) {
+        console.error("[sync] clone failed with hard error:", cloneErr);
+        this.handleGitError(cloneErr);
+        throw cloneErr;
+      }
+      // Empty remote (no refs to download) — bootstrap a local repo so sync can
+      // create the first commit and push it.
+      console.log("[sync] clone found empty repo, bootstrapping local git state");
       await git.init({ fs: this.fs, dir: GIT_DIR, defaultBranch: branch });
       await git.addRemote({ fs: this.fs, dir: GIT_DIR, remote: "origin", url: repoUrl });
       emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
@@ -152,29 +162,31 @@ export class SyncEngine {
 
     // 1. Fetch latest from origin. An empty remote has no refs — that's fine.
     let remoteIsEmpty = false;
-    console.log("[sync] fetching from origin, branch:", branch, "proxy:", GIT_CORS_PROXY);
-    try {
-      await git.fetch({
-        fs: this.fs,
-        http,
-        corsProxy: GIT_CORS_PROXY,
-        dir: GIT_DIR,
-        remote: "origin",
-        remoteRef: branch,
-        headers: authHeaders,
-      });
-    } catch (fetchErr) {
-      const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-      // "Could not find HEAD" = our local git state is broken (git.init was done
-      // but no commits exist yet and isomorphic-git can't resolve HEAD internally).
-      // Rethrow so the caller sees a real error instead of silently treating a
-      // corrupted local repo as an empty remote and making things worse.
-      if (msg.includes("Could not find HEAD")) {
-        console.error("[sync] broken local git state:", fetchErr);
-        throw fetchErr;
-      }
-      console.warn("[sync] fetch failed:", fetchErr);
+
+    // A local repo from git.init() + addRemote (our empty-remote fallback in clone())
+    // has no commits, so git.fetch() fails with "Could not find HEAD" when it tries
+    // to resolve the local tracking branch. Detect this case and skip fetch entirely —
+    // we're in a first-push flow anyway.
+    const localBranches = await git.listBranches({ fs: this.fs, dir: GIT_DIR }).catch(() => [] as string[]);
+    if (localBranches.length === 0) {
+      console.log("[sync] local repo has no commits yet, skipping fetch");
       remoteIsEmpty = true;
+    } else {
+      console.log("[sync] fetching from origin, branch:", branch, "proxy:", GIT_CORS_PROXY);
+      try {
+        await git.fetch({
+          fs: this.fs,
+          http,
+          corsProxy: GIT_CORS_PROXY,
+          dir: GIT_DIR,
+          remote: "origin",
+          remoteRef: branch,
+          headers: authHeaders,
+        });
+      } catch (fetchErr) {
+        console.warn("[sync] fetch failed:", fetchErr);
+        remoteIsEmpty = true;
+      }
     }
 
     // Confirm the remote ref actually landed after a successful fetch.
