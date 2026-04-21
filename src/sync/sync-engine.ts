@@ -3,8 +3,7 @@
 
 import git from "isomorphic-git";
 import { getDB } from "../storage/db.ts";
-import { loadTokens, saveTokens } from "../auth/token-store.ts";
-import { refreshAccessToken } from "../auth/device-flow.ts";
+import { loadTokens } from "../auth/token-store.ts";
 import { identityCodec } from "../codec/index.ts";
 import type { AuthPayload, NoteRecord, CanvasRecord, SyncState } from "../storage/schema.ts";
 import { createGitFS, type GitFS } from "./opfs-adapter.ts";
@@ -48,21 +47,6 @@ export class SyncEngine {
     if (!this.tokens) {
       emit({ event: "authRequired", data: {} });
       throw new Error("Not authenticated");
-    }
-    // Refresh if access token expires within 5 minutes.
-    if (Date.now() > this.tokens.accessTokenExpiresAt - 5 * 60 * 1000) {
-      if (Date.now() > this.tokens.refreshTokenExpiresAt) {
-        this.tokens = null;
-        emit({ event: "authRequired", data: {} });
-        throw new Error("Refresh token expired — re-authentication required");
-      }
-      this.tokens = await refreshAccessToken(
-        this.tokens.refreshToken,
-        this.tokens.installationId,
-        this.tokens.repoFullName,
-        this.tokens.repoDefaultBranch
-      );
-      await saveTokens(this.tokens);
     }
     return this.tokens;
   }

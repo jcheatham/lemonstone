@@ -60,20 +60,6 @@ self.addEventListener("message", async (e: MessageEvent<WorkerRequest>) => {
         break;
       }
 
-      case "authenticate": {
-        // Auth happens on the main thread (Device Flow); the worker just
-        // picks up the tokens that were saved to IndexedDB.
-        self.postMessage(ok(id));
-        break;
-      }
-
-      case "refresh": {
-        // Force a sync tick — used after the main thread signals new content.
-        await engine.sync();
-        self.postMessage(ok(id));
-        break;
-      }
-
       default: {
         self.postMessage(
           err(id, "UNKNOWN_OP", `Unknown op: ${op as string}`, false)

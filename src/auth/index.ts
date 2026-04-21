@@ -1,3 +1,3 @@
-export { requestDeviceCode, pollForToken, refreshAccessToken } from "./device-flow.ts";
-export type { DeviceCodeResponse, PollResult } from "./device-flow.ts";
+export { validatePAT, fetchRepo, listUserRepos, savePATAuth } from "./pat-auth.ts";
+export type { GitHubUser, GitHubRepo } from "./pat-auth.ts";
 export { saveTokens, loadTokens, clearTokens, isAuthenticated } from "./token-store.ts";
