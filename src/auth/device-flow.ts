@@ -6,6 +6,13 @@ import {
 import { saveTokens } from "./token-store.ts";
 import type { AuthPayload } from "../storage/schema.ts";
 
+// All GitHub login/* endpoints require form-encoded bodies to avoid a CORS
+// preflight OPTIONS request (they don't handle OPTIONS). Accept: application/json
+// is a CORS-safelisted header so it doesn't trigger preflight.
+function formBody(params: Record<string, string>): string {
+  return new URLSearchParams(params).toString();
+}
+
 export interface DeviceCodeResponse {
   deviceCode: string;
   userCode: string;
@@ -18,10 +25,10 @@ export async function requestDeviceCode(): Promise<DeviceCodeResponse> {
   const res = await fetch(GITHUB_DEVICE_CODE_URL, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
     },
-    body: JSON.stringify({ client_id: GITHUB_APP_CLIENT_ID }),
+    body: formBody({ client_id: GITHUB_APP_CLIENT_ID }),
   });
   if (!res.ok) throw new Error(`Device code request failed: ${res.status}`);
   const data = await res.json() as {
@@ -56,10 +63,10 @@ export async function pollForToken(
   const res = await fetch(GITHUB_ACCESS_TOKEN_URL, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
     },
-    body: JSON.stringify({
+    body: formBody({
       client_id: GITHUB_APP_CLIENT_ID,
       device_code: deviceCode,
       grant_type: "urn:ietf:params:oauth:grant-type:device_code",
@@ -100,10 +107,10 @@ export async function refreshAccessToken(
   const res = await fetch(GITHUB_ACCESS_TOKEN_URL, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
     },
-    body: JSON.stringify({
+    body: formBody({
       client_id: GITHUB_APP_CLIENT_ID,
       grant_type: "refresh_token",
       refresh_token: currentRefreshToken,
