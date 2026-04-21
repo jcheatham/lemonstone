@@ -4,7 +4,7 @@
 //   <ls-file-tree>, <ls-editor>, <ls-backlinks>, <ls-outline>,
 //   <ls-command-palette>, <ls-switcher>, hash router, vaultService.
 
-import { isAuthenticated } from "../auth/index.ts";
+import { isAuthenticated, clearTokens } from "../auth/index.ts";
 import { vaultService } from "../vault/index.ts";
 import { currentRoute, navigateTo, navigateHome } from "./router.ts";
 import type { Route } from "./router.ts";
@@ -265,6 +265,10 @@ export class LSApp extends HTMLElement {
       const { folder } = (e as CustomEvent<{ folder: string }>).detail;
       this.#newNote(folder);
     });
+    this.#fileTree.addEventListener("file-rename", (e) => {
+      const { oldPath, newPath } = (e as CustomEvent<{ oldPath: string; newPath: string }>).detail;
+      this.#renameNote(oldPath, newPath);
+    });
     filesPanel.appendChild(this.#fileTree);
 
     // Search tab panel
@@ -345,7 +349,15 @@ export class LSApp extends HTMLElement {
     this.#statusDot.className = "status-dot";
     this.#statusText = document.createElement("span");
     this.#statusText.textContent = "Ready";
-    statusBar.append(this.#statusDot, this.#statusText);
+    const signOutBtn = document.createElement("button");
+    signOutBtn.textContent = "Sign out";
+    signOutBtn.style.cssText =
+      "margin-left:auto;background:none;border:none;color:var(--ls-color-fg-muted,#64748b);" +
+      "font-size:11px;font-family:inherit;cursor:pointer;padding:0 4px;";
+    signOutBtn.addEventListener("mouseenter", () => { signOutBtn.style.color = "var(--ls-color-fg,#e0e0e0)"; });
+    signOutBtn.addEventListener("mouseleave", () => { signOutBtn.style.color = "var(--ls-color-fg-muted,#64748b)"; });
+    signOutBtn.addEventListener("click", () => this.#signOut());
+    statusBar.append(this.#statusDot, this.#statusText, signOutBtn);
     main.appendChild(statusBar);
 
     // Auth overlay
@@ -353,7 +365,10 @@ export class LSApp extends HTMLElement {
     this.#authOverlay.id = "auth-overlay";
     const modal = document.createElement("ls-modal");
     modal.id = "auth-modal";
-    modal.addEventListener("auth-complete", () => this.hideAuthOverlay());
+    modal.addEventListener("auth-complete", () => {
+      this.hideAuthOverlay();
+      this.#postAuthInit().catch(console.error);
+    });
     this.#authOverlay.appendChild(modal);
 
     // Palette + switcher (appended to shadow root, not inside a flex child)
@@ -393,8 +408,11 @@ export class LSApp extends HTMLElement {
     ed.path = path;
     ed.value = content;
     ed.addEventListener("input", (e) => {
-      const { content: c, path: p } = (e as CustomEvent<{ content: string; path: string }>).detail;
-      this.#onEditorInput(c, p);
+      // Guard: CodeMirror's contenteditable also fires native InputEvents that
+      // bubble out of the shadow DOM with detail=0. Only handle our CustomEvent.
+      const detail = (e as CustomEvent<{ content: string; path: string }>).detail;
+      if (!detail || typeof detail.content !== "string") return;
+      this.#onEditorInput(detail.content, detail.path);
     });
     this.#editorWrap.appendChild(ed);
     this.#editor = ed;
@@ -409,10 +427,23 @@ export class LSApp extends HTMLElement {
       this.#authOverlay.classList.add("visible");
       return;
     }
+    // Tokens exist — kick off a sync (auto-clones on first run).
+    vaultService.sync().catch(console.error);
     await this.#loadNoteList();
-    // Route to current hash.
-    const route = currentRoute();
-    await this.#handleRoute(route);
+    await this.#handleRoute(currentRoute());
+  }
+
+  async #postAuthInit(): Promise<void> {
+    this.#setStatus("syncing", "Cloning repository…");
+    try {
+      await vaultService.clone();
+    } catch (err) {
+      // An empty repo has nothing to clone; not fatal.
+      console.warn("Clone skipped or failed:", err);
+    }
+    this.#setStatus("ok", "Ready");
+    await this.#loadNoteList();
+    await this.#handleRoute(currentRoute());
   }
 
   // ── Vault event wiring ────────────────────────────────────────────────────
@@ -553,6 +584,27 @@ export class LSApp extends HTMLElement {
     const path = folder ? `${folder}/${base}.md` : `${base}.md`;
     await vaultService.writeNote(path, `# ${base}\n\n`);
     navigateTo(path);
+  }
+
+  #renameNote(oldPath: string, newPath: string): void {
+    if (oldPath === newPath) return;
+    vaultService.renameNote(oldPath, newPath)
+      .then(async () => {
+        await this.#loadNoteList();
+        if (this.#activePath === oldPath) {
+          navigateTo(newPath);
+        }
+      })
+      .catch((err) => {
+        this.#setStatus("error", "Rename failed");
+        console.error(err);
+      });
+  }
+
+  async #signOut(): Promise<void> {
+    if (!confirm("Sign out and clear stored credentials?")) return;
+    await clearTokens();
+    location.reload();
   }
 
   // ── Conflict resolution ───────────────────────────────────────────────────

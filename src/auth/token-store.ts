@@ -28,5 +28,6 @@ export async function clearTokens(): Promise<void> {
 export async function isAuthenticated(): Promise<boolean> {
   const tokens = await loadTokens();
   if (!tokens) return false;
-  return Date.now() < tokens.refreshTokenExpiresAt;
+  // PATs use accessTokenExpiresAt (refreshTokenExpiresAt is 0 for PATs).
+  return Date.now() < tokens.accessTokenExpiresAt;
 }

@@ -401,6 +401,10 @@ export class VaultService extends EventTarget {
 
   // ── Sync API ────────────────────────────────────────────────────────────────
 
+  async clone(): Promise<void> {
+    await this.syncClient.call("clone");
+  }
+
   async sync(): Promise<void> {
     await this.syncClient.call("sync");
   }

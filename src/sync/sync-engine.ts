@@ -10,6 +10,7 @@ import { createGitFS, type GitFS } from "./opfs-adapter.ts";
 import { RateLimiter } from "./rate-limiter.ts";
 import { createGitHttpPlugin } from "./github-http.ts";
 import { makeConflictPath } from "./conflict-utils.ts";
+import { GIT_CORS_PROXY } from "../config/github-app.ts";
 import type { WorkerEvent } from "./protocol.ts";
 
 const GIT_DIR = "/"; // root of the OPFS adapter — all paths relative here
@@ -51,44 +52,74 @@ export class SyncEngine {
     return this.tokens;
   }
 
-  private makeHttp(tokens: AuthPayload) {
+  private makeHttp() {
     return createGitHttpPlugin(
-      () => tokens.accessToken,
       this.rateLimiter,
       (resumeAt) => emit({ event: "rateLimited", data: { resumeAt } })
     );
   }
 
+  // GitHub returns 403 (not 401) for unauthenticated git requests to private
+  // repos, so isomorphic-git's onAuth callback (which fires on 401) is never
+  // invoked. We must include credentials on the very first request via headers.
+  private makeAuthHeaders(tokens: AuthPayload): Record<string, string> {
+    const encoded = btoa(`oauth2:${tokens.accessToken}`);
+    return {
+      "User-Agent": "lemonstone-pwa",
+      "Authorization": `Basic ${encoded}`,
+    };
+  }
+
   // ── Clone ──────────────────────────────────────────────────────────────────
 
+  // listBranches returns [] for repos with no commits, throws for non-git dirs.
+  private async isInitialized(): Promise<boolean> {
+    try {
+      await git.listBranches({ fs: this.fs, dir: GIT_DIR });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async clone(): Promise<void> {
+    if (await this.isInitialized()) return; // idempotent
+
     const tokens = await this.getValidTokens();
     const repoUrl = `https://github.com/${tokens.repoFullName}.git`;
+    const branch = tokens.repoDefaultBranch;
 
     emit({ event: "syncStarted", data: { op: "clone" } });
+
     try {
       await git.clone({
         fs: this.fs,
-        http: this.makeHttp(tokens),
+        http: this.makeHttp(),
+        corsProxy: GIT_CORS_PROXY,
         dir: GIT_DIR,
         url: repoUrl,
-        ref: tokens.repoDefaultBranch,
+        ref: branch,
         singleBranch: true,
         depth: 50, // shallow clone for initial speed
-        headers: { "User-Agent": "lemonstone-pwa" },
+        headers: this.makeAuthHeaders(tokens),
       });
+    } catch {
+      // Clone failed — almost certainly an empty repo with no commits.
+      // Bootstrap locally: init + configure remote so sync can push the first commit.
+      await git.init({ fs: this.fs, dir: GIT_DIR, defaultBranch: branch });
+      await git.addRemote({ fs: this.fs, dir: GIT_DIR, remote: "origin", url: repoUrl });
+      emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
+      return;
+    }
 
-      const headOid = await git.resolveRef({
-        fs: this.fs,
-        dir: GIT_DIR,
-        ref: tokens.repoDefaultBranch,
-      });
-
+    // Clone succeeded — remote may still be empty (no commits yet).
+    try {
+      const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch });
       await this.populateIndexedDB(headOid);
       emit({ event: "syncCompleted", data: { op: "clone", headOid } });
-    } catch (err) {
-      this.handleGitError(err);
-      throw err;
+    } catch {
+      // Empty remote: clone created .git but no branch ref exists yet.
+      emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
     }
   }
 
@@ -99,6 +130,10 @@ export class SyncEngine {
     this.syncing = true;
 
     try {
+      if (!(await this.isInitialized())) {
+        await this.clone();
+        return;
+      }
       await this.syncOnce();
     } finally {
       this.syncing = false;
@@ -109,24 +144,37 @@ export class SyncEngine {
     if (retryCount > 3) throw new Error("Sync retry limit exceeded");
 
     const tokens = await this.getValidTokens();
-    const http = this.makeHttp(tokens);
+    const http = this.makeHttp();
+    const authHeaders = this.makeAuthHeaders(tokens);
     const branch = tokens.repoDefaultBranch;
 
     emit({ event: "syncStarted", data: { op: "sync" } });
 
-    // 1. Fetch latest from origin.
-    await git.fetch({
-      fs: this.fs,
-      http,
-      dir: GIT_DIR,
-      remote: "origin",
-      remoteRef: branch,
-      headers: { "User-Agent": "lemonstone-pwa" },
-    });
+    // 1. Fetch latest from origin. An empty remote has no refs — that's fine.
+    let remoteIsEmpty = false;
+    try {
+      console.log("[sync] fetching from origin, branch:", branch, "proxy:", GIT_CORS_PROXY);
+      await git.fetch({
+        fs: this.fs,
+        http,
+        corsProxy: GIT_CORS_PROXY,
+        dir: GIT_DIR,
+        remote: "origin",
+        remoteRef: branch,
+        headers: authHeaders,
+      });
+      // Confirm the remote ref actually landed after fetch.
+      await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: `origin/${branch}` });
+      console.log("[sync] fetch complete, remote ref exists");
+    } catch (fetchErr) {
+      console.warn("[sync] fetch failed (treating as empty remote):", fetchErr);
+      // Fetch failed or remote ref missing — treat as empty remote.
+      remoteIsEmpty = true;
+    }
 
     // 2. Stage all dirty files from IndexedDB into the OPFS working tree.
     const dirtyPaths = await this.stageDirtyFiles();
-    if (dirtyPaths.length === 0 && !(await this.hasRemoteChanges(branch))) {
+    if (dirtyPaths.length === 0 && !remoteIsEmpty && !(await this.hasRemoteChanges(branch))) {
       emit({ event: "syncCompleted", data: { op: "sync", changed: 0 } });
       return;
     }
@@ -144,27 +192,35 @@ export class SyncEngine {
       newCommit = true;
     }
 
-    // 4. Merge remote into local.
-    const conflicts = await this.mergeRemote(branch, tokens);
-    if (conflicts.length > 0) {
-      for (const path of conflicts) {
-        emit({ event: "conflictDetected", data: { path } });
+    // 4. Merge remote into local (skip when remote is empty — nothing to merge).
+    if (!remoteIsEmpty) {
+      const conflicts = await this.mergeRemote(branch, tokens);
+      if (conflicts.length > 0) {
+        for (const path of conflicts) {
+          emit({ event: "conflictDetected", data: { path } });
+        }
+        // Do not push if there are unresolved conflicts.
+        return;
       }
-      // Do not push if there are unresolved conflicts.
-      return;
     }
 
-    // 5. Push.
-    if (newCommit || (await this.hasLocalAhead(branch))) {
+    // 5. Push if we have new commits or are ahead of remote.
+    const isAhead = !remoteIsEmpty && (await this.hasLocalAhead(branch));
+    if (newCommit || isAhead) {
+      console.log("[sync] pushing to origin, newCommit:", newCommit, "isAhead:", isAhead);
       try {
         await git.push({
           fs: this.fs,
           http,
+          corsProxy: GIT_CORS_PROXY,
           dir: GIT_DIR,
           remote: "origin",
           remoteRef: branch,
-          headers: { "User-Agent": "lemonstone-pwa" },
+          headers: authHeaders,
         });
+        // Push succeeded — mark committed files clean so the next sync
+        // doesn't re-stage and re-commit the same content.
+        await this.markStagedClean(dirtyPaths);
       } catch (err) {
         // Non-fast-forward: someone else pushed — retry the whole cycle.
         if (isPushRejected(err)) {
@@ -175,11 +231,7 @@ export class SyncEngine {
       }
     }
 
-    const headOid = await git.resolveRef({
-      fs: this.fs,
-      dir: GIT_DIR,
-      ref: branch,
-    });
+    const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
     emit({ event: "syncCompleted", data: { op: "sync", headOid } });
   }
 
@@ -200,6 +252,18 @@ export class SyncEngine {
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
+
+  private async markStagedClean(paths: string[]): Promise<void> {
+    if (paths.length === 0) return;
+    const db = await getDB();
+    for (const p of paths) {
+      const sha = await this.getBlobSha(p).catch(() => "");
+      const note = await db.get("notes", p);
+      if (note) await db.put("notes", { ...note, syncState: "clean" as SyncState, baseSha: sha });
+      const canvas = await db.get("canvas", p);
+      if (canvas) await db.put("canvas", { ...canvas, syncState: "clean" as SyncState, baseSha: sha });
+    }
+  }
 
   private async stageDirtyFiles(): Promise<string[]> {
     const db = await getDB();

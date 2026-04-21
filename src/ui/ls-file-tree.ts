@@ -5,8 +5,9 @@
 //   activePath — currently open path (highlighted)
 //
 // Events (bubbles, composed):
-//   file-open — detail: { path: string }
-//   file-new  — detail: { folder: string }
+//   file-open   — detail: { path: string }
+//   file-new    — detail: { folder: string }
+//   file-rename — detail: { oldPath: string; newPath: string }
 
 const style = `
   :host {
@@ -94,6 +95,18 @@ const style = `
     font-weight: 500;
   }
   .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .rename-input {
+    flex: 1;
+    background: var(--ls-color-bg-input, #0f0f1a);
+    border: 1px solid var(--ls-color-accent, #7c6af7);
+    border-radius: 3px;
+    color: var(--ls-color-fg, #e0e0e0);
+    font-size: 13px;
+    font-family: inherit;
+    padding: 1px 5px;
+    outline: none;
+    min-width: 0;
+  }
   .empty-hint {
     padding: 16px 12px;
     color: var(--ls-color-fg-muted, #64748b);
@@ -257,24 +270,92 @@ export class LSFileTree extends HTMLElement {
     div.className = "file-item" + (path === this.#activePath ? " active" : "");
     div.dataset["path"] = path;
     div.title = path;
+    div.tabIndex = 0;
+
+    const base = path.split("/").pop() ?? path;
+    const displayName = base.endsWith(".md") ? base.slice(0, -3) : base;
 
     const nameSpan = document.createElement("span");
     nameSpan.className = "file-name";
-    const base = path.split("/").pop() ?? path;
-    nameSpan.textContent = base.endsWith(".md") ? base.slice(0, -3) : base;
+    nameSpan.textContent = displayName;
     div.appendChild(nameSpan);
 
+    let clickTimer: ReturnType<typeof setTimeout> | null = null;
+
     div.addEventListener("click", () => {
-      this.dispatchEvent(
-        new CustomEvent("file-open", {
-          bubbles: true,
-          composed: true,
-          detail: { path },
-        })
-      );
+      // Single click opens; double-click triggers rename.
+      if (clickTimer) {
+        clearTimeout(clickTimer);
+        clickTimer = null;
+        this.#startRename(div, nameSpan, path);
+        return;
+      }
+      clickTimer = setTimeout(() => {
+        clickTimer = null;
+        this.dispatchEvent(
+          new CustomEvent("file-open", { bubbles: true, composed: true, detail: { path } })
+        );
+      }, 220);
+    });
+
+    div.addEventListener("keydown", (e) => {
+      if (e.key === "F2") {
+        e.preventDefault();
+        this.#startRename(div, nameSpan, path);
+      } else if (e.key === "Enter") {
+        this.dispatchEvent(
+          new CustomEvent("file-open", { bubbles: true, composed: true, detail: { path } })
+        );
+      }
     });
 
     return div;
+  }
+
+  #startRename(div: HTMLElement, nameSpan: HTMLElement, oldPath: string): void {
+    const base = oldPath.split("/").pop() ?? oldPath;
+    const displayName = base.endsWith(".md") ? base.slice(0, -3) : base;
+    const dir = oldPath.includes("/") ? oldPath.slice(0, oldPath.lastIndexOf("/") + 1) : "";
+
+    const input = document.createElement("input");
+    input.className = "rename-input";
+    input.value = displayName;
+    nameSpan.replaceWith(input);
+
+    // Select the name without triggering further rename.
+    requestAnimationFrame(() => { input.select(); });
+
+    const commit = (): void => {
+      const newName = input.value.trim();
+      if (newName && newName !== displayName) {
+        const ext = base.includes(".") ? base.slice(base.lastIndexOf(".")) : ".md";
+        const newPath = dir + newName + (newName.endsWith(ext) ? "" : ext);
+        this.dispatchEvent(
+          new CustomEvent("file-rename", {
+            bubbles: true,
+            composed: true,
+            detail: { oldPath, newPath },
+          })
+        );
+      }
+      // Restore span whether or not rename happened.
+      nameSpan.textContent = input.value.trim() || displayName;
+      input.replaceWith(nameSpan);
+      div.focus();
+    };
+
+    const cancel = (): void => {
+      input.replaceWith(nameSpan);
+      div.focus();
+    };
+
+    input.addEventListener("blur", commit);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); input.blur(); }
+      if (e.key === "Escape") { e.preventDefault(); input.removeEventListener("blur", commit); cancel(); }
+    });
+    // Prevent the click on the input from bubbling to file-open.
+    input.addEventListener("click", (e) => e.stopPropagation());
   }
 
   #emitNew(folder: string): void {

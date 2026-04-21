@@ -49,7 +49,10 @@ function convertOPFSErr(err: unknown, path: string): Error & { code: string } {
 }
 
 function pathParts(p: string): string[] {
-  return p.split("/").filter(Boolean);
+  // Filter both empty segments (from "//") and single-dot segments (from "/./").
+  // isomorphic-git builds paths as join(dir, filepath); with dir="/" this produces
+  // "//." for the working-tree root, which must reduce to [] (= root).
+  return p.split("/").filter(s => s.length > 0 && s !== ".");
 }
 
 class OPFSAdapter {
@@ -136,7 +139,7 @@ class OPFSAdapter {
 
     readdir: async (path) => {
       let dir: FileSystemDirectoryHandle;
-      if (!path || path === "/" || path === ".") {
+      if (!path || pathParts(path).length === 0) {
         dir = this.root;
       } else {
         try {
@@ -155,7 +158,7 @@ class OPFSAdapter {
     },
 
     mkdir: async (path) => {
-      if (!path || path === "/" || path === ".") return;
+      if (!path || pathParts(path).length === 0) return;
       const [dir, name] = await this.navToParent(path, true);
       try {
         await dir.getDirectoryHandle(name, { create: true });
@@ -167,7 +170,7 @@ class OPFSAdapter {
     },
 
     rmdir: async (path) => {
-      if (!path || path === "/" || path === ".") return;
+      if (!path || pathParts(path).length === 0) return;
       const [dir, name] = await this.navToParent(path);
       try {
         await dir.removeEntry(name, { recursive: true });
@@ -177,7 +180,7 @@ class OPFSAdapter {
     },
 
     stat: async (path) => {
-      if (!path || path === "/" || path === ".") {
+      if (!path || pathParts(path).length === 0) {
         return dirStat(Date.now());
       }
       const [dir, name] = await this.navToParent(path);

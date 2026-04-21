@@ -1,6 +1,10 @@
 // Sync Engine Web Worker — entry point.
 // All git operations run here; never on the main thread.
 
+// isomorphic-git relies on Node's Buffer global; polyfill it for the worker context.
+import { Buffer } from "buffer";
+(globalThis as unknown as Record<string, unknown>).Buffer = Buffer;
+
 import { SyncEngine } from "./sync-engine.ts";
 import type { WorkerRequest, WorkerResponse, WorkerError } from "./protocol.ts";
 

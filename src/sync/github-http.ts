@@ -35,7 +35,6 @@ async function* bodyIterator(
 }
 
 export function createGitHttpPlugin(
-  getToken: () => string,
   rateLimiter: RateLimiter,
   onRateLimited?: (resumeAt: number) => void
 ): HttpClient {
@@ -48,13 +47,17 @@ export function createGitHttpPlugin(
 
       const res = await fetch(req.url, {
         method: req.method ?? "GET",
-        headers: {
-          ...req.headers,
-          Authorization: `token ${getToken()}`,
-        },
+        headers: { ...req.headers },
         body,
         signal: req.signal as AbortSignal | undefined,
       });
+
+      if (res.status === 401 || res.status === 403) {
+        const bodyText = await res.clone().text().catch(() => "(unreadable)");
+        console.error(`[git-http] ${res.status} on ${req.method} ${req.url}`);
+        console.error(`[git-http] request headers:`, req.headers);
+        console.error(`[git-http] response body:`, bodyText);
+      }
 
       const headers: Record<string, string> = {};
       res.headers.forEach((value, key) => {
