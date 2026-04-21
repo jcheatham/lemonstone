@@ -351,9 +351,16 @@ export class LSApp extends HTMLElement {
     this.#statusDot.className = "status-dot";
     this.#statusText = document.createElement("span");
     this.#statusText.textContent = "Ready";
+    const buildLabel = document.createElement("span");
+    buildLabel.textContent = `build ${__BUILD_SHA__}`;
+    buildLabel.title = "Deployed build SHA";
+    buildLabel.style.cssText =
+      "margin-left:auto;color:var(--ls-color-fg-muted,#64748b);font-size:11px;" +
+      "font-family:var(--ls-font-mono,monospace);";
+
     this.#repoLabel = document.createElement("a");
     this.#repoLabel.style.cssText =
-      "margin-left:auto;color:var(--ls-color-fg-muted,#64748b);font-size:11px;" +
+      "margin-left:12px;color:var(--ls-color-fg-muted,#64748b);font-size:11px;" +
       "text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" +
       "max-width:200px;";
     this.#repoLabel.target = "_blank";
@@ -367,7 +374,7 @@ export class LSApp extends HTMLElement {
     signOutBtn.addEventListener("mouseenter", () => { signOutBtn.style.color = "var(--ls-color-fg,#e0e0e0)"; });
     signOutBtn.addEventListener("mouseleave", () => { signOutBtn.style.color = "var(--ls-color-fg-muted,#64748b)"; });
     signOutBtn.addEventListener("click", () => this.#signOut());
-    statusBar.append(this.#statusDot, this.#statusText, this.#repoLabel, signOutBtn);
+    statusBar.append(this.#statusDot, this.#statusText, buildLabel, this.#repoLabel, signOutBtn);
     main.appendChild(statusBar);
 
     // Auth overlay

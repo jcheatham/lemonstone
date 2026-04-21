@@ -72,10 +72,12 @@ export class SyncEngine {
 
   // ── Clone ──────────────────────────────────────────────────────────────────
 
-  // listBranches returns [] for repos with no commits, throws for non-git dirs.
+  // The HEAD file is written by git.init() and git.clone(). Its presence is the
+  // only reliable signal that a repo has been initialized here — listBranches()
+  // returns [] (not throws) for a totally empty OPFS directory.
   private async isInitialized(): Promise<boolean> {
     try {
-      await git.listBranches({ fs: this.fs, dir: GIT_DIR });
+      await this.fs.promises.readFile("/.git/HEAD");
       return true;
     } catch {
       return false;
@@ -91,6 +93,7 @@ export class SyncEngine {
 
     emit({ event: "syncStarted", data: { op: "clone" } });
 
+    console.log("[sync] cloning", repoUrl, "ref:", branch);
     try {
       await git.clone({
         fs: this.fs,
@@ -103,6 +106,7 @@ export class SyncEngine {
         depth: 50, // shallow clone for initial speed
         headers: this.makeAuthHeaders(tokens),
       });
+      console.log("[sync] git.clone returned without error");
     } catch (cloneErr) {
       const msg = cloneErr instanceof Error ? cloneErr.message : String(cloneErr);
       // Re-throw hard errors (auth, repo not found, network) so the caller knows
@@ -115,7 +119,7 @@ export class SyncEngine {
       }
       // Empty remote (no refs to download) — bootstrap a local repo so sync can
       // create the first commit and push it.
-      console.log("[sync] clone found empty repo, bootstrapping local git state");
+      console.warn("[sync] clone failed with non-HTTP error, falling back to local init:", cloneErr);
       await git.init({ fs: this.fs, dir: GIT_DIR, defaultBranch: branch });
       await git.addRemote({ fs: this.fs, dir: GIT_DIR, remote: "origin", url: repoUrl });
       emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
@@ -123,13 +127,24 @@ export class SyncEngine {
     }
 
     // Clone succeeded — remote may still be empty (no commits yet).
+    let headOid: string;
     try {
-      const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch });
+      headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch });
+      console.log("[sync] clone produced HEAD:", headOid);
+    } catch (refErr) {
+      console.warn("[sync] clone succeeded but branch ref missing:", refErr);
+      const localBranches = await git.listBranches({ fs: this.fs, dir: GIT_DIR }).catch(() => [] as string[]);
+      const remoteBranches = await git.listBranches({ fs: this.fs, dir: GIT_DIR, remote: "origin" }).catch(() => [] as string[]);
+      console.warn("[sync] local branches:", localBranches, "remote branches:", remoteBranches);
+      emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
+      return;
+    }
+    try {
       await this.populateIndexedDB(headOid);
       emit({ event: "syncCompleted", data: { op: "clone", headOid } });
-    } catch {
-      // Empty remote: clone created .git but no branch ref exists yet.
-      emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
+    } catch (popErr) {
+      console.error("[sync] populateIndexedDB failed:", popErr);
+      emit({ event: "syncCompleted", data: { op: "clone", headOid } });
     }
   }
 
