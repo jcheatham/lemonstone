@@ -452,9 +452,33 @@ export class LSApp extends HTMLElement {
     await this.#handleRoute(currentRoute());
   }
 
-  async #setRepoLabel(repoFullName: string): Promise<void> {
-    this.#repoLabel.textContent = repoFullName;
-    this.#repoLabel.href = `https://github.com/${repoFullName}`;
+  #currentRepo = "";
+  #currentSha = "";
+
+  #renderRepoLabel(): void {
+    if (!this.#currentRepo) {
+      this.#repoLabel.textContent = "";
+      this.#repoLabel.removeAttribute("href");
+      return;
+    }
+    const short = this.#currentSha ? this.#currentSha.slice(0, 7) : "";
+    this.#repoLabel.textContent = short
+      ? `${this.#currentRepo}#${short}`
+      : this.#currentRepo;
+    this.#repoLabel.href = this.#currentSha
+      ? `https://github.com/${this.#currentRepo}/commit/${this.#currentSha}`
+      : `https://github.com/${this.#currentRepo}`;
+  }
+
+  #setRepoLabel(repoFullName: string): void {
+    this.#currentRepo = repoFullName;
+    this.#renderRepoLabel();
+  }
+
+  #setRepoSha(headOid: string): void {
+    if (!headOid || headOid === this.#currentSha) return;
+    this.#currentSha = headOid;
+    this.#renderRepoLabel();
   }
 
   async #postAuthInit(): Promise<void> {
@@ -490,8 +514,10 @@ export class LSApp extends HTMLElement {
       this.#loadNoteList().catch(console.error);
     });
 
-    vaultService.addEventListener("vault:synced", () => {
+    vaultService.addEventListener("vault:synced", (e) => {
       this.#setStatus("ok", "Synced");
+      const headOid = (e as CustomEvent).detail?.headOid as string | undefined;
+      if (headOid) this.#setRepoSha(headOid);
       // Reload active note if it changed.
       if (this.#activePath) this.#reloadActiveNote().catch(console.error);
     });

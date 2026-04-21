@@ -103,8 +103,9 @@ export class VaultService extends EventTarget {
   // ── Sync wiring ─────────────────────────────────────────────────────────────
 
   private wireSyncEvents(): void {
-    this.syncClient.addEventListener("syncCompleted", () => {
-      this.onSyncCompleted().catch(console.error);
+    this.syncClient.addEventListener("syncCompleted", (e) => {
+      const headOid = (e as CustomEvent).detail?.headOid as string | undefined;
+      this.onSyncCompleted(headOid).catch(console.error);
     });
 
     this.syncClient.addEventListener("conflictDetected", (e) => {
@@ -133,7 +134,7 @@ export class VaultService extends EventTarget {
     });
   }
 
-  private async onSyncCompleted(): Promise<void> {
+  private async onSyncCompleted(headOid?: string): Promise<void> {
     // Re-read any notes whose updatedAt changed since we last indexed them.
     const records = await this.storage.listNotes();
     for (const record of records) {
@@ -152,7 +153,9 @@ export class VaultService extends EventTarget {
       }
     }
     this.scheduleSnapshotOnIdle();
-    this.dispatchEvent(new Event("vault:synced"));
+    this.dispatchEvent(
+      Object.assign(new Event("vault:synced"), { detail: { headOid } })
+    );
   }
 
   // ── Note API ────────────────────────────────────────────────────────────────

@@ -218,7 +218,8 @@ export class SyncEngine {
     // 2. Stage all dirty files from IndexedDB into the OPFS working tree.
     const dirtyPaths = await this.stageDirtyFiles();
     if (dirtyPaths.length === 0 && !remoteIsEmpty && !(await this.hasRemoteChanges(branch))) {
-      emit({ event: "syncCompleted", data: { op: "sync", changed: 0 } });
+      const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
+      emit({ event: "syncCompleted", data: { op: "sync", changed: 0, headOid } });
       return;
     }
 
