@@ -16,12 +16,14 @@ import "./ls-outline.ts";
 import "./ls-command-palette.ts";
 import "./ls-switcher.ts";
 import "./ls-editor.ts";
+import "./ls-search.ts";
 import type { LSFileTree } from "./ls-file-tree.ts";
 import type { LSBacklinks } from "./ls-backlinks.ts";
 import type { LSOutline } from "./ls-outline.ts";
 import type { LSCommandPalette } from "./ls-command-palette.ts";
 import type { LSSwitcher } from "./ls-switcher.ts";
 import type { LSEditor } from "./ls-editor.ts";
+import type { LSSearch } from "./ls-search.ts";
 
 const style = `
   :host {
@@ -44,6 +46,31 @@ const style = `
     flex-shrink: 0;
     background: var(--ls-color-bg-sidebar, #16162a);
   }
+  #sidebar-nav {
+    display: flex;
+    border-bottom: 1px solid var(--ls-color-border, #2a2a3e);
+    flex-shrink: 0;
+  }
+  #sidebar-nav button {
+    flex: 1;
+    background: none;
+    border: none;
+    color: var(--ls-color-fg-muted, #64748b);
+    font-size: 11px;
+    font-family: inherit;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 6px 4px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 0.1s;
+  }
+  #sidebar-nav button:hover { color: var(--ls-color-fg, #e0e0e0); }
+  #sidebar-nav button.active {
+    color: var(--ls-color-accent, #7c6af7);
+    border-bottom-color: var(--ls-color-accent, #7c6af7);
+  }
   #sidebar-top {
     flex: 1;
     overflow: hidden;
@@ -51,6 +78,8 @@ const style = `
     flex-direction: column;
     min-height: 0;
   }
+  #sidebar-top .tab-panel { display: none; flex: 1; overflow: hidden; flex-direction: column; min-height: 0; }
+  #sidebar-top .tab-panel.active { display: flex; }
   #sidebar-panels {
     flex-shrink: 0;
     max-height: 40vh;
@@ -161,6 +190,7 @@ export class LSApp extends HTMLElement {
   #outline!: LSOutline;
   #palette!: LSCommandPalette;
   #switcher!: LSSwitcher;
+  #search!: LSSearch;
   #editor: LSEditor | null = null;
   #activePath = "";
   #saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -176,11 +206,25 @@ export class LSApp extends HTMLElement {
     this.#registerCommands();
     this.#wireVaultEvents();
     this.#init().catch(console.error);
+    document.addEventListener("keydown", this.#onGlobalKey);
   }
 
   disconnectedCallback(): void {
     window.removeEventListener("route", this.#onRoute);
+    document.removeEventListener("keydown", this.#onGlobalKey);
   }
+
+  #onGlobalKey = (e: KeyboardEvent): void => {
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && e.shiftKey && e.key === "F") {
+      e.preventDefault();
+      this.#openSearchTab();
+    }
+    if (mod && !e.shiftKey && e.key === "n") {
+      e.preventDefault();
+      this.#newNote("").catch(console.error);
+    }
+  };
 
   hideAuthOverlay(): void {
     this.#authOverlay.classList.remove("visible");
@@ -193,8 +237,23 @@ export class LSApp extends HTMLElement {
     const sidebar = document.createElement("div");
     sidebar.id = "sidebar";
 
+    // Tab nav: Files | Search
+    const sidebarNav = document.createElement("div");
+    sidebarNav.id = "sidebar-nav";
+    const filesBtn = document.createElement("button");
+    filesBtn.textContent = "Files";
+    filesBtn.className = "active";
+    const searchBtn = document.createElement("button");
+    searchBtn.textContent = "Search";
+    sidebarNav.append(filesBtn, searchBtn);
+    sidebar.appendChild(sidebarNav);
+
     const sidebarTop = document.createElement("div");
     sidebarTop.id = "sidebar-top";
+
+    // Files tab panel
+    const filesPanel = document.createElement("div");
+    filesPanel.className = "tab-panel active";
 
     this.#fileTree = document.createElement("ls-file-tree") as LSFileTree;
     this.#fileTree.style.cssText = "flex:1;min-height:0;overflow:hidden;";
@@ -206,9 +265,38 @@ export class LSApp extends HTMLElement {
       const { folder } = (e as CustomEvent<{ folder: string }>).detail;
       this.#newNote(folder);
     });
+    filesPanel.appendChild(this.#fileTree);
 
-    sidebarTop.appendChild(this.#fileTree);
+    // Search tab panel
+    const searchPanel = document.createElement("div");
+    searchPanel.className = "tab-panel";
+
+    this.#search = document.createElement("ls-search") as LSSearch;
+    this.#search.style.cssText = "flex:1;min-height:0;";
+    this.#search.addEventListener("file-open", (e) => {
+      const { path } = (e as CustomEvent<{ path: string }>).detail;
+      navigateTo(path);
+      filesBtn.click(); // switch back to files tab after opening
+    });
+    searchPanel.appendChild(this.#search);
+
+    sidebarTop.append(filesPanel, searchPanel);
     sidebar.appendChild(sidebarTop);
+
+    // Tab switching logic
+    filesBtn.addEventListener("click", () => {
+      filesBtn.className = "active";
+      searchBtn.className = "";
+      filesPanel.className = "tab-panel active";
+      searchPanel.className = "tab-panel";
+    });
+    searchBtn.addEventListener("click", () => {
+      searchBtn.className = "active";
+      filesBtn.className = "";
+      searchPanel.className = "tab-panel active";
+      filesPanel.className = "tab-panel";
+      requestAnimationFrame(() => this.#search.focus());
+    });
 
     const sidebarPanels = document.createElement("div");
     sidebarPanels.id = "sidebar-panels";
@@ -480,6 +568,7 @@ export class LSApp extends HTMLElement {
   #registerCommands(): void {
     this.#palette.register({ id: "new-note", label: "New note", description: "Create a new note", shortcut: "Ctrl+N" });
     this.#palette.register({ id: "quick-open", label: "Quick open note", description: "Jump to a note by name", shortcut: "Ctrl+P" });
+    this.#palette.register({ id: "search", label: "Search notes", description: "Full-text search across vault", shortcut: "Ctrl+Shift+F" });
     this.#palette.register({ id: "go-home", label: "Go to home", description: "Show the welcome screen" });
     this.#palette.register({ id: "sync", label: "Sync now", description: "Push and pull from GitHub" });
   }
@@ -492,6 +581,9 @@ export class LSApp extends HTMLElement {
       case "quick-open":
         this.#switcher.open();
         break;
+      case "search":
+        this.#openSearchTab();
+        break;
       case "go-home":
         navigateHome();
         break;
@@ -503,6 +595,12 @@ export class LSApp extends HTMLElement {
         });
         break;
     }
+  }
+
+  #openSearchTab(): void {
+    // Click the Search nav button — it handles panel swap + focus.
+    const searchBtn = this.#shadow.querySelector<HTMLButtonElement>("#sidebar-nav button:last-child");
+    searchBtn?.click();
   }
 }
 

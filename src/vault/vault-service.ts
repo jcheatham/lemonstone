@@ -301,8 +301,8 @@ export class VaultService extends EventTarget {
 
   // ── Search API ──────────────────────────────────────────────────────────────
 
-  searchFullText(query: string): SearchResult[] {
-    return this.search.search(query);
+  searchFullText(query: string, opts?: { fields?: string[] }): SearchResult[] {
+    return this.search.search(query, opts);
   }
 
   async searchRegex(pattern: RegExp): Promise<string[]> {
