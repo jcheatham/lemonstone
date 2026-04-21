@@ -1,24 +1,93 @@
-// Sync Engine — runs in a dedicated Web Worker.
-// Full implementation in M3; this stub establishes the message boundary.
+// Sync Engine Web Worker — entry point.
+// All git operations run here; never on the main thread.
 
+import { SyncEngine } from "./sync-engine.ts";
 import type { WorkerRequest, WorkerResponse, WorkerError } from "./protocol.ts";
 
-function respond(res: WorkerResponse | WorkerError): void {
-  self.postMessage(res);
+const engine = new SyncEngine();
+let ready = engine.init().catch((err) => {
+  console.error("[sync-worker] init failed:", err);
+});
+
+function ok(id: string, result: Record<string, unknown> = {}): WorkerResponse {
+  return { id, ok: true, result };
 }
 
-self.addEventListener("message", (e: MessageEvent<WorkerRequest>) => {
-  const { id, op } = e.data;
-  // Placeholder: all ops return not-implemented until M3.
-  respond({
-    id,
-    ok: false,
-    error: {
-      code: "NOT_IMPLEMENTED",
-      message: `Op '${op}' not yet implemented`,
-      retryable: false,
-    },
-  });
+function err(
+  id: string,
+  code: string,
+  message: string,
+  retryable = false
+): WorkerError {
+  return { id, ok: false, error: { code, message, retryable } };
+}
+
+self.addEventListener("message", async (e: MessageEvent<WorkerRequest>) => {
+  const { id, op, args } = e.data;
+
+  // Ensure init has completed before handling any op.
+  try {
+    await ready;
+  } catch {
+    self.postMessage(err(id, "INIT_FAILED", "Sync engine failed to initialize"));
+    return;
+  }
+
+  try {
+    switch (op) {
+      case "clone": {
+        await engine.clone();
+        self.postMessage(ok(id));
+        break;
+      }
+
+      case "sync": {
+        await engine.sync();
+        self.postMessage(ok(id));
+        break;
+      }
+
+      case "getStatus": {
+        // Basic status — expand in M4 when VaultService is wired.
+        self.postMessage(ok(id, { status: "idle" }));
+        break;
+      }
+
+      case "resolveConflict": {
+        const path = args["path"] as string;
+        await engine.resolveConflict(path);
+        self.postMessage(ok(id));
+        break;
+      }
+
+      case "authenticate": {
+        // Auth happens on the main thread (Device Flow); the worker just
+        // picks up the tokens that were saved to IndexedDB.
+        self.postMessage(ok(id));
+        break;
+      }
+
+      case "refresh": {
+        // Force a sync tick — used after the main thread signals new content.
+        await engine.sync();
+        self.postMessage(ok(id));
+        break;
+      }
+
+      default: {
+        self.postMessage(
+          err(id, "UNKNOWN_OP", `Unknown op: ${op as string}`, false)
+        );
+      }
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    const code =
+      message.includes("authenticated") || message.includes("token")
+        ? "AUTH_ERROR"
+        : "SYNC_ERROR";
+    self.postMessage(err(id, code, message, code === "SYNC_ERROR"));
+  }
 });
 
 export {};
