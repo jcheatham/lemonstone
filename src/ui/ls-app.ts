@@ -863,6 +863,33 @@ export class LSApp extends HTMLElement {
     this.#renameNote(this.#activePath, normalized);
   }
 
+  async #showStorageQuota(): Promise<void> {
+    if (!navigator.storage?.estimate) {
+      getToast().show("Storage quota API not supported in this browser.", "warning", 5000);
+      return;
+    }
+    try {
+      const { usage = 0, quota = 0 } = await navigator.storage.estimate();
+      const fmt = (n: number): string => {
+        if (n > 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+        if (n > 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+        if (n > 1024) return `${(n / 1024).toFixed(1)} KB`;
+        return `${n} B`;
+      };
+      const pct = quota > 0 ? Math.round((usage / quota) * 100) : 0;
+      const persisted = (await navigator.storage.persisted?.()) ?? false;
+      const persistNote = persisted ? " · persistent" : " · best-effort";
+      getToast().show(
+        `Storage: ${fmt(usage)} of ${fmt(quota)} (${pct}%)${persistNote}`,
+        pct > 90 ? "warning" : "info",
+        8000
+      );
+    } catch (err) {
+      console.error(err);
+      getToast().show("Couldn't read storage quota.", "error", 4000);
+    }
+  }
+
   async #deleteActiveNote(): Promise<void> {
     if (!this.#activePath) {
       this.#setStatus("error", "No active note to delete");
@@ -943,6 +970,7 @@ export class LSApp extends HTMLElement {
     this.#palette.register({ id: "move-note", label: "Move active note…", description: "Change the path of the currently-open note" });
     this.#palette.register({ id: "delete-note", label: "Delete active note", description: "Delete the currently-open note" });
     this.#palette.register({ id: "install-app", label: "Install Lemonstone", description: "Install as a PWA on this device" });
+    this.#palette.register({ id: "storage-quota", label: "Show storage quota", description: "How much browser storage the vault is using" });
     this.#palette.register({ id: "go-home", label: "Go to home", description: "Show the welcome screen" });
     this.#palette.register({ id: "sync", label: "Sync now", description: "Push and pull from GitHub" });
   }
@@ -983,6 +1011,9 @@ export class LSApp extends HTMLElement {
         } else {
           triggerInstall().catch(console.error);
         }
+        break;
+      case "storage-quota":
+        this.#showStorageQuota().catch(console.error);
         break;
       case "go-home":
         navigateHome();
