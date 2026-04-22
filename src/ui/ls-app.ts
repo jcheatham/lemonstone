@@ -22,6 +22,8 @@ import "./ls-category-nav.ts";
 import type { LSCategoryNav } from "./ls-category-nav.ts";
 import "./ls-calendar.ts";
 import type { LSCalendar } from "./ls-calendar.ts";
+import { canInstall, triggerInstall } from "../pwa.ts";
+import { getToast } from "./ls-toast.ts";
 import type { LSFileTree } from "./ls-file-tree.ts";
 import type { LSBacklinks } from "./ls-backlinks.ts";
 import type { LSOutline } from "./ls-outline.ts";
@@ -940,6 +942,7 @@ export class LSApp extends HTMLElement {
     this.#palette.register({ id: "daily-tomorrow", label: "Open tomorrow's daily note" });
     this.#palette.register({ id: "move-note", label: "Move active note…", description: "Change the path of the currently-open note" });
     this.#palette.register({ id: "delete-note", label: "Delete active note", description: "Delete the currently-open note" });
+    this.#palette.register({ id: "install-app", label: "Install Lemonstone", description: "Install as a PWA on this device" });
     this.#palette.register({ id: "go-home", label: "Go to home", description: "Show the welcome screen" });
     this.#palette.register({ id: "sync", label: "Sync now", description: "Push and pull from GitHub" });
   }
@@ -969,6 +972,17 @@ export class LSApp extends HTMLElement {
         break;
       case "delete-note":
         this.#deleteActiveNote();
+        break;
+      case "install-app":
+        if (!canInstall()) {
+          getToast().show(
+            "Install not available. Your browser may not support PWA install, or Lemonstone is already installed.",
+            "info",
+            6000
+          );
+        } else {
+          triggerInstall().catch(console.error);
+        }
         break;
       case "go-home":
         navigateHome();

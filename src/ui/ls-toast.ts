@@ -27,6 +27,29 @@ template.innerHTML = `
   .toast.success { background: #1e3a2a; color: #86efac; }
   .toast.warning { background: #3a2f1a; color: #fcd34d; }
   .toast.error   { background: #3a1a1a; color: #f87171; }
+  .toast.action  { display: flex; align-items: center; gap: 12px; }
+  .toast.action button {
+    background: rgba(255,255,255,0.12);
+    color: inherit;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    padding: 3px 10px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .toast.action button:hover { background: rgba(255,255,255,0.2); }
+  .toast .dismiss {
+    background: none;
+    border: none;
+    color: inherit;
+    opacity: 0.6;
+    cursor: pointer;
+    font: inherit;
+    font-size: 16px;
+    padding: 0 4px;
+  }
+  .toast .dismiss:hover { opacity: 1; }
   @keyframes slide-in {
     from { transform: translateX(120%); opacity: 0; }
     to   { transform: translateX(0);   opacity: 1; }
@@ -48,6 +71,39 @@ export class LSToast extends HTMLElement {
     el.textContent = message;
     shadow.appendChild(el);
     setTimeout(() => el.remove(), durationMs);
+  }
+
+  /**
+   * Sticky toast with an action button and a dismiss affordance. Used for
+   * things that require user intent (e.g. "update available").
+   * Returns a function that removes the toast imperatively.
+   */
+  showAction(
+    message: string,
+    actionLabel: string,
+    onAction: () => void,
+    variant: ToastVariant = "info"
+  ): () => void {
+    const shadow = this.shadowRoot!;
+    const el = document.createElement("div");
+    el.className = `toast action ${variant}`;
+    const text = document.createElement("span");
+    text.style.flex = "1";
+    text.textContent = message;
+    const actionBtn = document.createElement("button");
+    actionBtn.textContent = actionLabel;
+    actionBtn.addEventListener("click", () => {
+      onAction();
+      el.remove();
+    });
+    const dismissBtn = document.createElement("button");
+    dismissBtn.className = "dismiss";
+    dismissBtn.textContent = "×";
+    dismissBtn.title = "Dismiss";
+    dismissBtn.addEventListener("click", () => el.remove());
+    el.append(text, actionBtn, dismissBtn);
+    shadow.appendChild(el);
+    return () => el.remove();
   }
 }
 

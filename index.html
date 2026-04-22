@@ -4,10 +4,14 @@
     <meta charset="UTF-8" />
     <meta http-equiv="Content-Security-Policy"
       content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-ieoeWczDHkReVBsRBqaal5AFMlBtNjMzgwKvLqi/tSU='; connect-src 'self' https://api.github.com https://github.com https://cors.isomorphic-git.org; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://avatars.githubusercontent.com;" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#1a1a2e" />
-    <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
-    <link rel="manifest" href="/manifest.json" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Lemonstone" />
+    <link rel="icon" type="image/svg+xml" href="icons/icon.svg" />
+    <link rel="apple-touch-icon" href="icons/lemonstone_192.png" />
+    <!-- vite-plugin-pwa injects the correct <link rel="manifest"> at build time. -->
     <title>Lemonstone</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
