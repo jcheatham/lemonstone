@@ -301,6 +301,8 @@ export class SyncEngine {
     if (paths.length === 0) return;
     const db = await getDB();
     for (const p of paths) {
+      // Any tombstone for this path was just honored by the push — clear it.
+      await db.delete("tombstones", p);
       const sha = await this.getBlobSha(p).catch(() => "");
       const note = await db.get("notes", p);
       if (note) await db.put("notes", { ...note, syncState: "clean" as SyncState, baseSha: sha });
@@ -312,11 +314,9 @@ export class SyncEngine {
   private async stageDirtyFiles(): Promise<string[]> {
     const db = await getDB();
     const staged: string[] = [];
-    const dbPaths = new Set<string>();
 
     const notes = await db.getAll("notes");
     for (const note of notes) {
-      dbPaths.add(note.path);
       if (note.syncState === "dirty") {
         // Write at-rest bytes directly to OPFS (codec already applied in StorageAdapter).
         await this.fs.promises.writeFile(`/${note.path}`, note.content);
@@ -327,7 +327,6 @@ export class SyncEngine {
 
     const canvases = await db.getAll("canvas");
     for (const canvas of canvases) {
-      dbPaths.add(canvas.path);
       if (canvas.syncState === "dirty") {
         await this.fs.promises.writeFile(`/${canvas.path}`, canvas.content);
         await git.add({ fs: this.fs, dir: GIT_DIR, filepath: canvas.path });
@@ -337,7 +336,6 @@ export class SyncEngine {
 
     const attachments = await db.getAll("attachments");
     for (const att of attachments) {
-      dbPaths.add(att.path);
       if (att.syncState === "dirty") {
         await this.fs.promises.writeFile(`/${att.path}`, att.blob);
         await git.add({ fs: this.fs, dir: GIT_DIR, filepath: att.path });
@@ -345,28 +343,46 @@ export class SyncEngine {
       }
     }
 
-    // Stage deletions: any content file present in HEAD but absent from IDB
-    // was deleted locally and needs to be removed from git + OPFS so the
-    // deletion lands in the next commit.
-    const branch = this.tokens?.repoDefaultBranch ?? "main";
-    const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
-    if (headOid) {
-      const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid: headOid });
-      const fs = this.fs;
-      async function* walkTree(treeOid: string, prefix: string): AsyncGenerator<string> {
-        const { tree } = await git.readTree({ fs, dir: GIT_DIR, oid: treeOid });
-        for (const entry of tree) {
-          const entryPath = prefix ? `${prefix}/${entry.path}` : entry.path;
-          if (entry.type === "blob") yield entryPath;
-          else if (entry.type === "tree") yield* walkTree(entry.oid, entryPath);
+    // Stage deletions via explicit tombstones ONLY. Absence from IDB is not
+    // a reliable signal — a stale IndexedDB from an old client or a partial
+    // reconcile would otherwise silently remove remote data. Tombstones are
+    // written by vaultService.delete* and cleared in markStagedClean after
+    // a successful push.
+    const tombstones = await db.getAll("tombstones");
+    if (tombstones.length > 0) {
+      // Collect HEAD paths so we can drop tombstones for files that never made
+      // it to git (created + deleted locally in the same session).
+      const branch = this.tokens?.repoDefaultBranch ?? "main";
+      const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
+      const headPaths = new Set<string>();
+      if (headOid) {
+        const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid: headOid });
+        const fs = this.fs;
+        async function* walkTree(treeOid: string, prefix: string): AsyncGenerator<string> {
+          const { tree } = await git.readTree({ fs, dir: GIT_DIR, oid: treeOid });
+          for (const entry of tree) {
+            const entryPath = prefix ? `${prefix}/${entry.path}` : entry.path;
+            if (entry.type === "blob") yield entryPath;
+            else if (entry.type === "tree") yield* walkTree(entry.oid, entryPath);
+          }
         }
+        for await (const p of walkTree(commit.tree, "")) headPaths.add(p);
       }
-      for await (const filepath of walkTree(commit.tree, "")) {
-        if (!isContentFile(filepath)) continue;
-        if (dbPaths.has(filepath)) continue;
-        try { await this.fs.promises.unlink(`/${filepath}`); } catch { /* already gone */ }
-        try { await git.remove({ fs: this.fs, dir: GIT_DIR, filepath }); } catch { /* already unstaged */ }
-        staged.push(filepath);
+
+      for (const tomb of tombstones) {
+        if (!headPaths.has(tomb.path)) {
+          // Never committed — tombstone is obsolete, just drop it.
+          try { await this.fs.promises.unlink(`/${tomb.path}`); } catch { /* ok */ }
+          await db.delete("tombstones", tomb.path);
+          continue;
+        }
+        try { await this.fs.promises.unlink(`/${tomb.path}`); } catch { /* already gone */ }
+        try {
+          await git.remove({ fs: this.fs, dir: GIT_DIR, filepath: tomb.path });
+          staged.push(tomb.path);
+        } catch (err) {
+          console.warn("[sync] git.remove failed for tombstone:", tomb.path, err);
+        }
       }
     }
 

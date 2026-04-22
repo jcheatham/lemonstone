@@ -62,6 +62,11 @@ export interface ConfigRecord {
   value: unknown;
 }
 
+export interface Tombstone {
+  path: string;
+  deletedAt: number;
+}
+
 export interface LemonstoneDB {
   auth: {
     key: string;
@@ -87,5 +92,9 @@ export interface LemonstoneDB {
   config: {
     key: string;
     value: ConfigRecord;
+  };
+  tombstones: {
+    key: string;
+    value: Tombstone;
   };
 }

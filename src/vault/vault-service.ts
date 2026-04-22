@@ -1,5 +1,6 @@
 import { StorageAdapter } from "../storage/storage-adapter.ts";
 import { identityCodec } from "../codec/index.ts";
+import { getDB } from "../storage/db.ts";
 import type { NoteRecord } from "../storage/schema.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
 import { extractAllTags } from "./tags.ts";
@@ -190,6 +191,7 @@ export class VaultService extends EventTarget {
 
   async deleteNote(path: string): Promise<void> {
     await this.storage.deleteNote(path);
+    await this.markTombstone(path);
     this.clearLinkGraph(path);
     this.clearTagIndex(path);
     this.search.remove(path);
@@ -301,10 +303,16 @@ export class VaultService extends EventTarget {
 
   async deleteCanvas(path: string): Promise<void> {
     await this.storage.deleteCanvas(path);
+    await this.markTombstone(path);
     this.dispatchEvent(
       Object.assign(new Event("note:deleted"), { detail: { path } })
     );
     this.enqueueSyncTick();
+  }
+
+  private async markTombstone(path: string): Promise<void> {
+    const db = await getDB();
+    await db.put("tombstones", { path, deletedAt: Date.now() });
   }
 
   async renameCanvas(oldPath: string, newPath: string): Promise<void> {

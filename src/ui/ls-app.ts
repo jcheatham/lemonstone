@@ -1015,6 +1015,7 @@ export class LSApp extends HTMLElement {
         db.clear("attachments"),
         db.clear("indexes-snapshot"),
         db.clear("config"),
+        db.clear("tombstones"),
       ]);
     } catch (err) {
       console.error("Failed to clear local DB:", err);
