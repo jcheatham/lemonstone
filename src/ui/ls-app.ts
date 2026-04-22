@@ -24,6 +24,8 @@ import "./ls-calendar.ts";
 import type { LSCalendar } from "./ls-calendar.ts";
 import "./ls-canvas.ts";
 import type { LSCanvas } from "./ls-canvas.ts";
+import "./ls-history.ts";
+import type { LSHistory, CommitSummary } from "./ls-history.ts";
 import { parseCanvas, serializeCanvas, emptyCanvas, mergeCanvases } from "../canvas/index.ts";
 import { canInstall, triggerInstall } from "../pwa.ts";
 import { getToast } from "./ls-toast.ts";
@@ -253,6 +255,8 @@ export class LSApp extends HTMLElement {
   #categoryNav!: LSCategoryNav;
   #categoryPanel!: HTMLElement;
   #calendar!: LSCalendar;
+  #history!: LSHistory;
+  #activeCommitOid = "";
   readonly #dailyFolder = "daily";
   #previewedCategory = "files";
   #activeCategory: string | null = null;
@@ -310,6 +314,7 @@ export class LSApp extends HTMLElement {
       { id: "files", label: "Files" },
       { id: "calendar", label: "Calendar" },
       { id: "search", label: "Search" },
+      { id: "history", label: "History" },
     ];
     this.#categoryNav.previewed = this.#previewedCategory;
     this.#categoryNav.addEventListener("category-preview", (e) => {
@@ -392,7 +397,23 @@ export class LSApp extends HTMLElement {
     });
     searchPanel.appendChild(this.#search);
 
-    this.#categoryPanel.append(filesPanel, calendarPanel, searchPanel);
+    // History panel
+    const historyPanel = document.createElement("div");
+    historyPanel.className = "panel-content";
+    historyPanel.dataset["category"] = "history";
+    this.#history = document.createElement("ls-history") as LSHistory;
+    this.#history.style.cssText = "flex:1;min-height:0;";
+    this.#history.addEventListener("commit-select", (e) => {
+      const { oid } = (e as CustomEvent<{ oid: string }>).detail;
+      this.#openCommit(oid).catch(console.error);
+      this.#drillInto("history");
+    });
+    this.#history.addEventListener("history-refresh", () => {
+      this.#loadHistory().catch(console.error);
+    });
+    historyPanel.appendChild(this.#history);
+
+    this.#categoryPanel.append(filesPanel, calendarPanel, searchPanel, historyPanel);
     this.#showPanel(this.#previewedCategory);
 
     // If the panel is dimmed (rail was expanded back to picker), any click
@@ -510,6 +531,7 @@ export class LSApp extends HTMLElement {
     this.#showPanel(id);
     this.#categoryPanel.classList.remove("dimmed");
     if (id === "search") requestAnimationFrame(() => this.#search.focus());
+    if (id === "history") this.#loadHistory().catch(console.error);
   }
 
   #onCategoryDrill(id: string): void {
@@ -629,11 +651,244 @@ export class LSApp extends HTMLElement {
     }, 400);
   }
 
+  // ── History view ─────────────────────────────────────────────────────────
+
+  async #loadHistory(): Promise<void> {
+    try {
+      const commits = await vaultService.recentCommits(50);
+      this.#history.commits = commits as CommitSummary[];
+      this.#history.activeOid = this.#activeCommitOid;
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  async #openCommit(oid: string): Promise<void> {
+    this.#activeCommitOid = oid;
+    this.#history.activeOid = oid;
+    this.#activePath = "";
+    this.#fileTree.activePath = "";
+    this.#calendar.activePath = "";
+
+    const details = await vaultService.commitDetails(oid);
+    if (!details) {
+      this.#showWelcome();
+      getToast().show("Couldn't read that commit.", "error", 4000);
+      return;
+    }
+
+    this.#editorWrap.innerHTML = "";
+    this.#editor = null;
+    this.#outline.headings = [];
+    this.#backlinks.links = [];
+    this.#conflictBanner.classList.remove("visible");
+
+    const view = document.createElement("div");
+    view.style.cssText =
+      "height:100%;overflow:auto;padding:24px 32px;font-size:13px;" +
+      "color:var(--ls-color-fg,#e0e0e0);";
+
+    const title = document.createElement("h2");
+    title.textContent = details.message.split("\n")[0] ?? "(no message)";
+    title.style.cssText = "margin:0 0 12px;font-size:18px;font-weight:600;";
+
+    const meta = document.createElement("div");
+    meta.style.cssText =
+      "color:var(--ls-color-fg-muted,#64748b);font-size:12px;margin-bottom:20px;" +
+      "font-family:var(--ls-font-mono,monospace);";
+    const when = new Date(details.date).toLocaleString();
+    meta.textContent = `${details.oid}  ·  ${details.author}  ·  ${when}`;
+
+    const actions = document.createElement("div");
+    actions.style.cssText = "display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap;";
+    const restoreBtn = document.createElement("button");
+    restoreBtn.textContent = "Restore to this commit";
+    restoreBtn.style.cssText =
+      "background:var(--ls-color-accent,#7c6af7);color:white;border:none;" +
+      "padding:6px 14px;border-radius:4px;font:inherit;font-size:13px;cursor:pointer;";
+    restoreBtn.addEventListener("click", () => this.#restoreToCommit(details.oid));
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "Copy SHA";
+    copyBtn.style.cssText =
+      "background:rgba(255,255,255,0.06);color:inherit;border:1px solid var(--ls-color-border,#2a2a3e);" +
+      "padding:6px 14px;border-radius:4px;font:inherit;font-size:13px;cursor:pointer;";
+    copyBtn.addEventListener("click", () => {
+      navigator.clipboard.writeText(details.oid).catch(console.error);
+      getToast().show("SHA copied to clipboard.", "info", 2500);
+    });
+    actions.append(restoreBtn, copyBtn);
+
+    const changesHeader = document.createElement("h3");
+    changesHeader.textContent = `${details.changes.length} file${details.changes.length === 1 ? "" : "s"} changed`;
+    changesHeader.style.cssText = "margin:0 0 10px;font-size:13px;font-weight:600;";
+
+    const list = document.createElement("ul");
+    list.style.cssText = "list-style:none;padding:0;margin:0;";
+    if (details.changes.length === 0) {
+      const empty = document.createElement("li");
+      empty.textContent = "(no changes)";
+      empty.style.cssText = "color:var(--ls-color-fg-muted,#64748b);font-style:italic;";
+      list.appendChild(empty);
+    } else {
+      for (const change of details.changes) {
+        const item = document.createElement("li");
+        item.style.cssText =
+          "display:flex;gap:10px;padding:4px 0;font-family:var(--ls-font-mono,monospace);font-size:12px;";
+        const status = document.createElement("span");
+        status.textContent = change.status;
+        const color =
+          change.status === "A" ? "#86efac" :
+          change.status === "D" ? "#f87171" : "#fcd34d";
+        status.style.cssText = `color:${color};font-weight:600;width:14px;flex-shrink:0;`;
+        const name = document.createElement("span");
+        name.textContent = change.path;
+        name.style.cssText = "color:var(--ls-color-fg,#e0e0e0);word-break:break-all;";
+        item.append(status, name);
+        list.appendChild(item);
+      }
+    }
+
+    view.append(title, meta, actions, changesHeader, list);
+    this.#editorWrap.appendChild(view);
+  }
+
+  async #restoreToCommit(oid: string): Promise<void> {
+    const dirtyNotes = (await vaultService.listNotes()).filter((n) => n.syncState === "dirty");
+    if (dirtyNotes.length > 0 && !confirm(
+      `You have ${dirtyNotes.length} unsynced change(s) that will be lost if you restore. Continue?`
+    )) return;
+    if (!confirm(
+      `Restore to commit ${oid.slice(0, 7)}?\n\nThis creates a new commit that sets every file to its state at that point. Files added since then will be removed; modified files will revert.`
+    )) return;
+
+    this.#setStatus("syncing", `Restoring to ${oid.slice(0, 7)}…`);
+    try {
+      await vaultService.restoreToCommit(oid);
+      await this.#loadNoteList();
+      await this.#loadHistory();
+      this.#setStatus("ok", "Restored");
+      getToast().show(`Restored to ${oid.slice(0, 7)}. Sync in progress.`, "success", 4000);
+      navigateHome();
+    } catch (err) {
+      console.error(err);
+      this.#setStatus("error", "Restore failed");
+      getToast().show("Restore failed. See console.", "error", 5000);
+    }
+  }
+
   async #newCanvas(): Promise<void> {
     const base = `Untitled-${Date.now()}`;
     const path = `${base}.canvas`;
     await vaultService.writeCanvas(path, serializeCanvas(emptyCanvas()));
     navigateTo(path);
+  }
+
+  // ── Folder operations ────────────────────────────────────────────────────
+  // Git doesn't track empty folders, so "new folder" creates a README.md
+  // placeholder inside it. Rename/delete operate on all files under a
+  // trailing-slash prefix.
+
+  #normalizeFolder(input: string | null): string | null {
+    if (!input) return null;
+    const cleaned = input.trim().replace(/^\/+|\/+$/g, "");
+    return cleaned || null;
+  }
+
+  async #newFolder(): Promise<void> {
+    const folder = this.#normalizeFolder(prompt("New folder path (e.g. projects/work):"));
+    if (!folder) return;
+    const path = `${folder}/README.md`;
+    const existing = await vaultService.readNote(path);
+    if (existing !== null) {
+      getToast().show(`${path} already exists`, "info", 4000);
+      navigateTo(path);
+      return;
+    }
+    const label = folder.split("/").pop() ?? folder;
+    await vaultService.writeNote(path, `# ${label}\n\n`);
+    await this.#loadNoteList();
+    navigateTo(path);
+  }
+
+  async #renameFolder(): Promise<void> {
+    const oldFolder = this.#normalizeFolder(prompt("Rename folder — current path:"));
+    if (!oldFolder) return;
+    const newFolder = this.#normalizeFolder(prompt("Rename folder — new path:", oldFolder));
+    if (!newFolder || newFolder === oldFolder) return;
+    const oldPrefix = oldFolder + "/";
+    const newPrefix = newFolder + "/";
+
+    const entries = (await vaultService.list()).filter((e) => e.path.startsWith(oldPrefix));
+    if (entries.length === 0) {
+      getToast().show(`No files under "${oldFolder}"`, "info", 4000);
+      return;
+    }
+
+    this.#setStatus("syncing", `Renaming ${entries.length} file(s)…`);
+    try {
+      for (const entry of entries) {
+        const nextPath = newPrefix + entry.path.slice(oldPrefix.length);
+        await vaultService.rename(entry.path, nextPath);
+      }
+      await this.#loadNoteList();
+      if (this.#activePath.startsWith(oldPrefix)) {
+        navigateTo(newPrefix + this.#activePath.slice(oldPrefix.length));
+      }
+      this.#setStatus("ok", "Folder renamed");
+    } catch (err) {
+      console.error(err);
+      this.#setStatus("error", "Rename folder failed");
+    }
+  }
+
+  async #showHistory(): Promise<void> {
+    try {
+      const commits = await vaultService.recentCommits(30);
+      if (commits.length === 0) {
+        getToast().show("No commits yet (or repo not yet cloned).", "info", 4000);
+        return;
+      }
+      const lines = commits.map((c) => {
+        const short = c.oid.slice(0, 7);
+        const when = new Date(c.date).toISOString().slice(0, 16).replace("T", " ");
+        return `${short} ${when} ${c.author}: ${c.message}`;
+      });
+      // Drop the full list into the console for detail; toast a summary.
+      console.log("[history] recent commits:\n" + lines.join("\n"));
+      getToast().show(
+        `${commits.length} recent commit(s) logged to the console (see DevTools).`,
+        "info",
+        5000
+      );
+    } catch (err) {
+      console.error(err);
+      getToast().show("Couldn't read commit history.", "error", 4000);
+    }
+  }
+
+  async #deleteFolder(): Promise<void> {
+    const folder = this.#normalizeFolder(prompt("Delete folder — path:"));
+    if (!folder) return;
+    const prefix = folder + "/";
+    const entries = (await vaultService.list()).filter((e) => e.path.startsWith(prefix));
+    if (entries.length === 0) {
+      getToast().show(`No files under "${folder}"`, "info", 4000);
+      return;
+    }
+    if (!confirm(`Delete ${entries.length} file(s) under "${folder}"? This cannot be undone.`)) return;
+
+    this.#setStatus("syncing", `Deleting ${entries.length} file(s)…`);
+    try {
+      for (const entry of entries) {
+        await vaultService.delete(entry.path);
+      }
+      await this.#loadNoteList();
+      if (this.#activePath.startsWith(prefix)) navigateHome();
+      this.#setStatus("ok", "Folder deleted");
+    } catch (err) {
+      console.error(err);
+      this.#setStatus("error", "Delete folder failed");
+    }
   }
 
   #mountEditor(path: string, content: string): void {
@@ -749,12 +1004,26 @@ export class LSApp extends HTMLElement {
       // Refresh the file list — catches remote adds/removes that don't emit
       // per-note events (reconcileFromOPFS writes directly to IndexedDB).
       this.#loadNoteList().catch(console.error);
+      this.#loadHistory().catch(console.error);
       // Reload active note if it changed.
       if (this.#activePath) this.#reloadActiveNote().catch(console.error);
     });
 
     vaultService.addEventListener("vault:syncError", (e) => {
-      const msg = (e as CustomEvent<{ message?: string }>).detail?.message ?? "Sync error";
+      const detail = (e as CustomEvent<{ message?: string; reason?: string; dropped?: string[] }>).detail;
+      if (detail?.reason === "unsafe_push") {
+        this.#setStatus("error", "Sync blocked — merge would remove remote files");
+        const n = detail.dropped?.length ?? 0;
+        const preview = (detail.dropped ?? []).slice(0, 3).join(", ");
+        getToast().showAction(
+          `Sync refused: local copy is out of date and would silently delete ${n} remote file(s)${preview ? ` (e.g. ${preview})` : ""}. Use "Force pull from remote" to reset local, or "Show recent commits" to inspect.`,
+          "Dismiss",
+          () => { /* noop */ },
+          "warning"
+        );
+        return;
+      }
+      const msg = detail?.message ?? "Sync error";
       this.#setStatus("error", msg);
     });
 
@@ -1110,6 +1379,10 @@ export class LSApp extends HTMLElement {
   #registerCommands(): void {
     this.#palette.register({ id: "new-note", label: "New note", description: "Create a new note", shortcut: "Ctrl+N" });
     this.#palette.register({ id: "new-canvas", label: "New canvas", description: "Create a new JSON Canvas file" });
+    this.#palette.register({ id: "show-history", label: "Show recent commits", description: "List the last 30 commits on the current branch" });
+    this.#palette.register({ id: "new-folder", label: "New folder…", description: "Create a folder with a placeholder README" });
+    this.#palette.register({ id: "rename-folder", label: "Rename folder…", description: "Rename a folder and all files inside" });
+    this.#palette.register({ id: "delete-folder", label: "Delete folder…", description: "Delete a folder and everything inside it" });
     this.#palette.register({ id: "canvas-edit-text", label: "Canvas: edit selected text node", description: "Enter edit mode on a selected text node (fallback for when double-click fails)" });
     this.#palette.register({ id: "quick-open", label: "Quick open note", description: "Jump to a note by name", shortcut: "Ctrl+P" });
     this.#palette.register({ id: "search", label: "Search notes", description: "Full-text search across vault", shortcut: "Ctrl+Shift+F" });
@@ -1133,6 +1406,18 @@ export class LSApp extends HTMLElement {
         break;
       case "new-canvas":
         this.#newCanvas().catch(console.error);
+        break;
+      case "new-folder":
+        this.#newFolder().catch(console.error);
+        break;
+      case "rename-folder":
+        this.#renameFolder().catch(console.error);
+        break;
+      case "delete-folder":
+        this.#deleteFolder().catch(console.error);
+        break;
+      case "show-history":
+        this.#showHistory().catch(console.error);
         break;
       case "canvas-edit-text": {
         const canvas = this.#editorWrap.querySelector("ls-canvas") as LSCanvas | null;

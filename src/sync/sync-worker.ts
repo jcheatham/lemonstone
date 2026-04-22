@@ -76,6 +76,27 @@ self.addEventListener("message", async (e: MessageEvent<WorkerRequest>) => {
         break;
       }
 
+      case "recentCommits": {
+        const limit = typeof args["limit"] === "number" ? args["limit"] : 30;
+        const commits = await engine.recentCommits(limit);
+        self.postMessage(ok(id, { commits }));
+        break;
+      }
+
+      case "commitDetails": {
+        const oid = args["oid"] as string;
+        const details = await engine.commitDetails(oid);
+        self.postMessage(ok(id, { details }));
+        break;
+      }
+
+      case "restoreToCommit": {
+        const oid = args["oid"] as string;
+        await engine.restoreToCommit(oid);
+        self.postMessage(ok(id));
+        break;
+      }
+
       default: {
         self.postMessage(
           err(id, "UNKNOWN_OP", `Unknown op: ${op as string}`, false)

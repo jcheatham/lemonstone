@@ -104,8 +104,18 @@ export class VaultService extends EventTarget {
 
   private wireSyncEvents(): void {
     this.syncClient.addEventListener("syncCompleted", (e) => {
-      const headOid = (e as CustomEvent).detail?.headOid as string | undefined;
-      this.onSyncCompleted(headOid).catch(console.error);
+      const detail = (e as CustomEvent).detail as { headOid?: string; error?: string; dropped?: string[] } | undefined;
+      if (detail?.error === "unsafe_push") {
+        // Sync engine refused to push because the merge result was missing
+        // files that still exist on remote. Bubble up so the UI can warn.
+        this.dispatchEvent(
+          Object.assign(new Event("vault:syncError"), {
+            detail: { reason: "unsafe_push", dropped: detail.dropped ?? [] },
+          })
+        );
+        return;
+      }
+      this.onSyncCompleted(detail?.headOid).catch(console.error);
     });
 
     this.syncClient.addEventListener("conflictDetected", (e) => {
@@ -217,9 +227,14 @@ export class VaultService extends EventTarget {
   // or a future resource type should prefer these. Adding a new kind of file
   // means wiring it into the switch in one place, not across every UI call site.
 
+  /** Extensions that are treated as notes (stored in the notes store, opened
+   *  in the markdown/text editor). Mirror of sync-engine's TEXT_EXTENSIONS. */
+  static readonly #NOTE_EXTENSIONS = new Set([".md", ".txt"]);
+
   static #kindFromPath(path: string): "note" | "canvas" | "unknown" {
     if (path.endsWith(".canvas")) return "canvas";
-    if (path.endsWith(".md")) return "note";
+    const dot = path.lastIndexOf(".");
+    if (dot >= 0 && VaultService.#NOTE_EXTENSIONS.has(path.slice(dot).toLowerCase())) return "note";
     return "unknown";
   }
 
@@ -336,6 +351,28 @@ export class VaultService extends EventTarget {
 
   async forcePush(): Promise<void> {
     await this.syncClient.call("forcePush");
+  }
+
+  async recentCommits(limit = 30): Promise<Array<{ oid: string; message: string; author: string; date: number }>> {
+    const res = await this.syncClient.call("recentCommits", { limit });
+    return (res.result as { commits: Array<{ oid: string; message: string; author: string; date: number }> }).commits;
+  }
+
+  async commitDetails(oid: string): Promise<{
+    oid: string;
+    message: string;
+    author: string;
+    date: number;
+    changes: Array<{ path: string; status: "A" | "M" | "D" }>;
+  } | null> {
+    const res = await this.syncClient.call("commitDetails", { oid });
+    return (res.result as { details: unknown }).details as ReturnType<typeof this.commitDetails> extends Promise<infer T> ? T : never;
+  }
+
+  async restoreToCommit(oid: string): Promise<void> {
+    await this.syncClient.call("restoreToCommit", { oid });
+    // After the worker commits locally, kick off a sync so it pushes.
+    await this.syncClient.call("sync").catch(console.error);
   }
 
   // ── Attachment API ──────────────────────────────────────────────────────────

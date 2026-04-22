@@ -6,7 +6,10 @@ export type SyncOp =
   | "getStatus"
   | "resolveConflict"
   | "forcePull"
-  | "forcePush";
+  | "forcePush"
+  | "recentCommits"
+  | "commitDetails"
+  | "restoreToCommit";
 
 export interface WorkerRequest {
   id: string;

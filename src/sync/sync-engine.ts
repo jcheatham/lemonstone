@@ -14,7 +14,10 @@ import { GIT_CORS_PROXY } from "../config/github-app.ts";
 import type { WorkerEvent } from "./protocol.ts";
 
 const GIT_DIR = "/"; // root of the OPFS adapter — all paths relative here
-const CONTENT_EXTENSIONS = new Set([".md", ".canvas"]);
+// Text-ish extensions get treated like notes (stored in the notes store,
+// opened in the markdown/text editor). Easy to extend as we add support.
+const TEXT_EXTENSIONS = new Set([".md", ".txt"]);
+const CONTENT_EXTENSIONS = new Set([...TEXT_EXTENSIONS, ".canvas"]);
 const ATTACHMENT_EXTENSIONS = new Set([
   ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
   ".pdf", ".mp4", ".mp3",
@@ -316,7 +319,22 @@ export class SyncEngine {
       }
     }
 
-    // 5. Push if we have new commits or are ahead of remote.
+    // 5. Pre-push safety net. Refuse to push if the commit/merge result is
+    // missing remote files that the user hasn't explicitly tombstoned. This
+    // catches a class of failures where a merge silently drops files
+    // (isomorphic-git quirks, shallow history, divergent histories, etc.)
+    // and prevents the bad state from reaching GitHub.
+    if (!remoteIsEmpty && (newCommit || (await this.hasLocalAhead(branch)))) {
+      const dropped = await this.#detectUnexpectedDrops(branch);
+      if (dropped.length > 0) {
+        const msg = `Refusing to push: merge result is missing ${dropped.length} file(s) that exist on remote and were not explicitly deleted: ${dropped.slice(0, 3).join(", ")}${dropped.length > 3 ? "…" : ""}`;
+        console.error("[sync]", msg, dropped);
+        emit({ event: "syncCompleted", data: { op: "sync", error: "unsafe_push", dropped } });
+        throw new Error(msg);
+      }
+    }
+
+    // 6. Push if we have new commits or are ahead of remote.
     const isAhead = !remoteIsEmpty && (await this.hasLocalAhead(branch));
     if (newCommit || isAhead) {
       console.log("[sync] pushing to origin, newCommit:", newCommit, "isAhead:", isAhead);
@@ -620,7 +638,7 @@ export class SyncEngine {
       seenPaths.add(path);
       const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
 
-      if (ext === ".md") {
+      if (TEXT_EXTENSIONS.has(ext)) {
         const existing = await db.get("notes", path);
         // Preserve local dirty edits — they'll sync on the next tick.
         if (existing?.syncState === "dirty") continue;
@@ -702,7 +720,7 @@ export class SyncEngine {
       if (!bytes) continue;
       const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
 
-      if (ext === ".md") {
+      if (TEXT_EXTENSIONS.has(ext)) {
         const record: NoteRecord = {
           path,
           content: bytes,
@@ -783,6 +801,202 @@ export class SyncEngine {
     if (paths.length === 1) return `Update ${paths[0]}`;
     if (paths.length <= 3) return `Update ${paths.join(", ")}`;
     return `Update ${paths.length} files`;
+  }
+
+  /**
+   * Enumerate every blob path reachable from a commit's tree.
+   * Used by the pre-push safety check to diff local vs remote trees.
+   */
+  private async treePaths(commitOid: string): Promise<Set<string>> {
+    const out = new Set<string>();
+    if (!commitOid) return out;
+    let commit;
+    try {
+      commit = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid: commitOid });
+    } catch {
+      return out;
+    }
+    const fs = this.fs;
+    async function* walk(treeOid: string, prefix: string): AsyncGenerator<string> {
+      const { tree } = await git.readTree({ fs, dir: GIT_DIR, oid: treeOid });
+      for (const entry of tree) {
+        const p = prefix ? `${prefix}/${entry.path}` : entry.path;
+        if (entry.type === "blob") yield p;
+        else if (entry.type === "tree") yield* walk(entry.oid, p);
+      }
+    }
+    for await (const p of walk(commit.commit.tree, "")) out.add(p);
+    return out;
+  }
+
+  /**
+   * Return the set of file paths that exist on origin/<branch> but are
+   * missing from local <branch>'s tree, minus any paths covered by
+   * tombstones. A non-empty result means a push would silently remove
+   * remote data — abort.
+   */
+  async #detectUnexpectedDrops(branch: string): Promise<string[]> {
+    const localOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
+    const remoteOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: `origin/${branch}` }).catch(() => "");
+    if (!localOid || !remoteOid) return [];
+
+    const [localPaths, remotePaths] = await Promise.all([
+      this.treePaths(localOid),
+      this.treePaths(remoteOid),
+    ]);
+
+    const db = await getDB();
+    const tombstoned = new Set((await db.getAll("tombstones")).map((t) => t.path));
+
+    const dropped: string[] = [];
+    for (const p of remotePaths) {
+      if (localPaths.has(p)) continue;
+      if (tombstoned.has(p)) continue;
+      dropped.push(p);
+    }
+    return dropped;
+  }
+
+  /**
+   * Recent commit history for the current branch (for the "view history"
+   * palette command). Returns up to `limit` commits in reverse-chrono order.
+   */
+  async recentCommits(limit = 30): Promise<{ oid: string; message: string; author: string; date: number }[]> {
+    const branch = this.tokens?.repoDefaultBranch ?? "main";
+    try {
+      const entries = await git.log({ fs: this.fs, dir: GIT_DIR, ref: branch, depth: limit });
+      return entries.map((e) => ({
+        oid: e.oid,
+        message: e.commit.message.split("\n")[0] ?? "",
+        author: e.commit.author.name,
+        date: e.commit.author.timestamp * 1000,
+      }));
+    } catch (err) {
+      console.warn("[sync] recentCommits failed:", err);
+      return [];
+    }
+  }
+
+  /**
+   * Metadata for a single commit plus the list of files changed relative to
+   * its first parent. Used by the History view to show what a commit did.
+   */
+  async commitDetails(oid: string): Promise<{
+    oid: string;
+    message: string;
+    author: string;
+    date: number;
+    changes: Array<{ path: string; status: "A" | "M" | "D" }>;
+  } | null> {
+    try {
+      const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid });
+      const curPaths = await this.treePaths(oid);
+      let parentPaths = new Set<string>();
+      if (commit.parent && commit.parent[0]) {
+        parentPaths = await this.treePaths(commit.parent[0]);
+      }
+
+      // For modification detection, compare blob OIDs at each path when both
+      // sides have the path. Requires walking both trees a second time to
+      // collect OIDs, not just paths.
+      const curBlobs = await this.treeBlobs(oid);
+      const parentBlobs = commit.parent?.[0] ? await this.treeBlobs(commit.parent[0]) : new Map<string, string>();
+
+      const changes: Array<{ path: string; status: "A" | "M" | "D" }> = [];
+      for (const p of curPaths) {
+        if (!parentPaths.has(p)) changes.push({ path: p, status: "A" });
+        else if (curBlobs.get(p) !== parentBlobs.get(p)) changes.push({ path: p, status: "M" });
+      }
+      for (const p of parentPaths) {
+        if (!curPaths.has(p)) changes.push({ path: p, status: "D" });
+      }
+      changes.sort((a, b) => a.path.localeCompare(b.path));
+
+      return {
+        oid,
+        message: commit.message,
+        author: `${commit.author.name} <${commit.author.email}>`,
+        date: commit.author.timestamp * 1000,
+        changes,
+      };
+    } catch (err) {
+      console.warn("[sync] commitDetails failed:", err);
+      return null;
+    }
+  }
+
+  private async treeBlobs(commitOid: string): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    let commit;
+    try { commit = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid: commitOid }); }
+    catch { return out; }
+    const fs = this.fs;
+    async function* walk(treeOid: string, prefix: string): AsyncGenerator<{ path: string; oid: string }> {
+      const { tree } = await git.readTree({ fs, dir: GIT_DIR, oid: treeOid });
+      for (const entry of tree) {
+        const p = prefix ? `${prefix}/${entry.path}` : entry.path;
+        if (entry.type === "blob") yield { path: p, oid: entry.oid };
+        else if (entry.type === "tree") yield* walk(entry.oid, p);
+      }
+    }
+    for await (const { path, oid } of walk(commit.commit.tree, "")) out.set(path, oid);
+    return out;
+  }
+
+  /**
+   * Create a new commit whose tree matches the target commit. Forward-only —
+   * no history rewriting. Files added since the target commit are removed
+   * (tombstoned so the safety check allows the push); modified files revert
+   * to their target-commit content.
+   */
+  async restoreToCommit(targetOid: string): Promise<void> {
+    emit({ event: "syncStarted", data: { op: "restore" } });
+    const branch = this.tokens?.repoDefaultBranch ?? "main";
+    const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch });
+
+    const headBlobs = await this.treeBlobs(headOid);
+    const targetBlobs = await this.treeBlobs(targetOid);
+
+    const db = await getDB();
+
+    // 1. Files present in HEAD but not in target: remove + tombstone.
+    for (const [path] of headBlobs) {
+      if (targetBlobs.has(path)) continue;
+      try { await this.fs.promises.unlink(`/${path}`); } catch { /* ok */ }
+      try { await git.remove({ fs: this.fs, dir: GIT_DIR, filepath: path }); } catch { /* ok */ }
+      await db.put("tombstones", { path, deletedAt: Date.now() });
+      await db.delete("notes", path).catch(() => {});
+      await db.delete("canvas", path).catch(() => {});
+    }
+
+    // 2. Files in target: write target's blob content to OPFS + git.add.
+    //    Skip if content matches what's already in the working tree.
+    for (const [path, blobOid] of targetBlobs) {
+      if (headBlobs.get(path) === blobOid) continue; // unchanged
+      const bytes = await this.readBlobBytes(blobOid);
+      if (!bytes) continue;
+      await this.fs.promises.writeFile(`/${path}`, bytes);
+      await git.add({ fs: this.fs, dir: GIT_DIR, filepath: path });
+      // Also clear tombstones for this path in case a tombstone was stale.
+      await db.delete("tombstones", path).catch(() => {});
+    }
+
+    // 3. Commit the restoration.
+    const author = await this.getAuthor(await this.getValidTokens());
+    const short = targetOid.slice(0, 7);
+    await git.commit({
+      fs: this.fs,
+      dir: GIT_DIR,
+      message: `Restore to ${short}`,
+      author,
+    });
+
+    // 4. Rebuild IDB from the new HEAD so the UI reflects the restored state.
+    const newHead = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch });
+    await this.populateIndexedDB(newHead);
+
+    // 5. Hand back to normal sync for the actual push.
+    emit({ event: "syncCompleted", data: { op: "restore", headOid: newHead } });
   }
 
   private async hasRemoteChanges(branch: string): Promise<boolean> {
