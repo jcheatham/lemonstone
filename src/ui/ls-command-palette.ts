@@ -121,6 +121,22 @@ export class LSCommandPalette extends HTMLElement {
     this.#commands.push(cmd);
   }
 
+  /** Read-only list of every registered command, for the Commands category panel. */
+  get commands(): readonly PaletteCommand[] {
+    return this.#commands;
+  }
+
+  /** Fire a command by id (as if the user had picked it in the palette). */
+  trigger(id: string): void {
+    this.dispatchEvent(
+      new CustomEvent("palette-command", {
+        bubbles: true,
+        composed: true,
+        detail: { id },
+      })
+    );
+  }
+
   open(): void {
     this.#input.value = "";
     this.#filter("");

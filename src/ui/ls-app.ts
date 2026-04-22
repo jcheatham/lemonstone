@@ -40,12 +40,22 @@ import type { LSSearch } from "./ls-search.ts";
 const style = `
   :host {
     display: flex;
+    flex-direction: column;
     height: 100vh;
     width: 100vw;
     overflow: hidden;
     font-family: var(--ls-font-ui, system-ui, sans-serif);
     background: var(--ls-color-bg, #1a1a2e);
     color: var(--ls-color-fg, #e0e0e0);
+  }
+  /* Row layout that houses the three main panes. Sits between the optional
+     mobile breadcrumb (on top) and the always-visible status bar (at bottom). */
+  #layout {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    min-height: 0;
+    overflow: hidden;
   }
   #category-panel {
     width: 280px;
@@ -96,6 +106,43 @@ const style = `
     font-size: 12px;
     font-style: italic;
     text-align: center;
+  }
+
+  /* Commands category list */
+  .commands-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+  .command-row {
+    display: block;
+    width: 100%;
+    padding: 8px 14px;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+  }
+  .command-row:hover { background: rgba(255,255,255,0.05); }
+  .command-row .command-main {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 13px;
+  }
+  .command-row .command-label { flex: 1; color: var(--ls-color-fg, #e0e0e0); }
+  .command-row .command-shortcut {
+    color: var(--ls-color-fg-muted, #64748b);
+    font-family: var(--ls-font-mono, monospace);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .command-row .command-desc {
+    font-size: 11px;
+    color: var(--ls-color-fg-muted, #64748b);
+    margin-top: 2px;
   }
   #main {
     flex: 1;
@@ -220,20 +267,17 @@ const style = `
   #mobile-breadcrumb .bc-sep { color: var(--ls-color-fg-muted, #64748b); font-size: 14px; padding: 0 2px; }
 
   @media (max-width: 720px) {
-    :host { flex-direction: column; }
-
-    /* Level 0 (category picker) — category nav fills viewport, everything else hidden. */
+    /* Level 0 — category nav fills the pane; panel/main hidden. */
     :host([data-mobile-level="0"]) ls-category-nav {
       width: 100%;
       max-width: none;
       min-width: 0;
-      height: 100%;
       border-right: none;
     }
     :host([data-mobile-level="0"]) #category-panel { display: none; }
     :host([data-mobile-level="0"]) #main { display: none; }
 
-    /* Level 1 (drilled but no content) — breadcrumb + category panel full-width. */
+    /* Level 1 — breadcrumb + category panel full-width. */
     :host([data-mobile-level="1"]) ls-category-nav { display: none; }
     :host([data-mobile-level="1"]) #category-panel {
       width: 100%;
@@ -244,7 +288,7 @@ const style = `
     :host([data-mobile-level="1"]) #main { display: none; }
     :host([data-mobile-level="1"]) #mobile-breadcrumb { display: flex; }
 
-    /* Level 2 (content open) — breadcrumb + main pane full-width. */
+    /* Level 2 — breadcrumb + main pane full-width. */
     :host([data-mobile-level="2"]) ls-category-nav,
     :host([data-mobile-level="2"]) #category-panel { display: none; }
     :host([data-mobile-level="2"]) #main { width: 100%; }
@@ -317,9 +361,11 @@ export class LSApp extends HTMLElement {
   #categoryNav!: LSCategoryNav;
   #categoryPanel!: HTMLElement;
   #mobileBreadcrumb!: HTMLElement;
+  #statusBar!: HTMLElement;
   #calendar!: LSCalendar;
   #history!: LSHistory;
   #activeCommitOid = "";
+  #commandsPanel!: HTMLElement;
   readonly #dailyFolder = "daily";
   #previewedCategory = "files";
   #activeCategory: string | null = null;
@@ -378,6 +424,7 @@ export class LSApp extends HTMLElement {
       { id: "calendar", label: "Calendar" },
       { id: "search", label: "Search" },
       { id: "history", label: "History" },
+      { id: "commands", label: "Commands" },
     ];
     this.#categoryNav.previewed = this.#previewedCategory;
     this.#categoryNav.addEventListener("category-drill", (e) => {
@@ -472,7 +519,13 @@ export class LSApp extends HTMLElement {
     });
     historyPanel.appendChild(this.#history);
 
-    this.#categoryPanel.append(filesPanel, calendarPanel, searchPanel, historyPanel);
+    // Commands panel — rendered lazily after #registerCommands runs, since
+    // commands aren't registered until after buildLayout completes.
+    this.#commandsPanel = document.createElement("div");
+    this.#commandsPanel.className = "panel-content";
+    this.#commandsPanel.dataset["category"] = "commands";
+
+    this.#categoryPanel.append(filesPanel, calendarPanel, searchPanel, historyPanel, this.#commandsPanel);
     this.#showPanel(this.#previewedCategory);
 
     // If the panel is dimmed (rail was expanded back to picker), any click
@@ -539,7 +592,9 @@ export class LSApp extends HTMLElement {
     signOutBtn.addEventListener("mouseleave", () => { signOutBtn.style.color = "var(--ls-color-fg-muted,#64748b)"; });
     signOutBtn.addEventListener("click", () => this.#signOut());
     statusBar.append(this.#statusDot, this.#statusText, buildLabel, this.#repoLabel, signOutBtn);
-    main.appendChild(statusBar);
+    // Status bar is intentionally NOT appended to #main. It sits at the root
+    // so it stays visible regardless of which pane is showing on mobile.
+    this.#statusBar = statusBar;
 
     // Auth overlay
     this.#authOverlay = document.createElement("div");
@@ -567,11 +622,14 @@ export class LSApp extends HTMLElement {
     this.#mobileBreadcrumb = document.createElement("div");
     this.#mobileBreadcrumb.id = "mobile-breadcrumb";
 
+    const layout = document.createElement("div");
+    layout.id = "layout";
+    layout.append(this.#categoryNav, this.#categoryPanel, main);
+
     this.#shadow.append(
       this.#mobileBreadcrumb,
-      this.#categoryNav,
-      this.#categoryPanel,
-      main,
+      layout,
+      this.#statusBar,
       this.#authOverlay,
       this.#palette,
       this.#switcher
@@ -1541,6 +1599,44 @@ export class LSApp extends HTMLElement {
     this.#palette.register({ id: "force-push", label: "Force push to remote (overwrite remote changes)", description: "Push local state to GitHub, discarding any commits that aren't in your local copy" });
     this.#palette.register({ id: "go-home", label: "Go to home", description: "Show the welcome screen" });
     this.#palette.register({ id: "sync", label: "Sync now", description: "Push and pull from GitHub" });
+
+    // Commands category panel mirrors the palette contents.
+    this.#populateCommandsPanel();
+  }
+
+  #populateCommandsPanel(): void {
+    const panel = this.#commandsPanel;
+    panel.replaceChildren();
+    const list = document.createElement("div");
+    list.className = "commands-list";
+    for (const cmd of this.#palette.commands) {
+      const row = document.createElement("button");
+      row.className = "command-row";
+      row.dataset["id"] = cmd.id;
+
+      const main = document.createElement("div");
+      main.className = "command-main";
+      const label = document.createElement("span");
+      label.className = "command-label";
+      label.textContent = cmd.label;
+      main.appendChild(label);
+      if (cmd.shortcut) {
+        const short = document.createElement("span");
+        short.className = "command-shortcut";
+        short.textContent = cmd.shortcut;
+        main.appendChild(short);
+      }
+      row.appendChild(main);
+      if (cmd.description) {
+        const desc = document.createElement("div");
+        desc.className = "command-desc";
+        desc.textContent = cmd.description;
+        row.appendChild(desc);
+      }
+      row.addEventListener("click", () => this.#onPaletteCommand(cmd.id));
+      list.appendChild(row);
+    }
+    panel.appendChild(list);
   }
 
   #onPaletteCommand(id: string): void {
