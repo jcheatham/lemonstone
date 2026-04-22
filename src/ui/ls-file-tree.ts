@@ -75,7 +75,13 @@ const style = `
   .folder-label .new-btn:hover { background: rgba(255,255,255,0.1); }
   .folder-arrow { font-size: 9px; transition: transform 0.15s; display: inline-block; }
   .folder-label.collapsed .folder-arrow { transform: rotate(-90deg); }
-  .folder-children { }
+  .folder-children {
+    /* Visual indent per nesting level. Stacks recursively for deep trees
+       (e.g. daily/YYYY/MM/DD/events.md). The border-left acts as a subtle
+       guide line connecting a folder's descendants. */
+    margin-left: 16px;
+    border-left: 1px solid var(--ls-color-border, #2a2a3e);
+  }
   .folder-children.hidden { display: none; }
   .file-item {
     display: flex;
@@ -189,13 +195,25 @@ export class LSFileTree extends HTMLElement {
   }
 
   #buildTree(paths: string[]): Map<string, string[]> {
-    // Returns folder → file[] map; root files under key "".
+    // Returns folder → file[] map; root files under key "". Intermediate folder
+    // keys are added even when they contain no direct children so the render
+    // pass can find them (e.g. daily/2026 shows up above daily/2026/04/16).
     const folders = new Map<string, string[]>();
+    folders.set("", []);
     for (const p of [...paths].sort()) {
       const slash = p.lastIndexOf("/");
       const folder = slash >= 0 ? p.slice(0, slash) : "";
       if (!folders.has(folder)) folders.set(folder, []);
       folders.get(folder)!.push(p);
+
+      // Seed every ancestor folder so the tree walker can traverse through
+      // paths that only contain subdirectories (no direct files of their own).
+      let ancestor = folder;
+      while (ancestor) {
+        const up = ancestor.lastIndexOf("/");
+        ancestor = up >= 0 ? ancestor.slice(0, up) : "";
+        if (!folders.has(ancestor)) folders.set(ancestor, []);
+      }
     }
     return folders;
   }

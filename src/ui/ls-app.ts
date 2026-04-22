@@ -18,6 +18,10 @@ import "./ls-command-palette.ts";
 import "./ls-switcher.ts";
 import "./ls-editor.ts";
 import "./ls-search.ts";
+import "./ls-category-nav.ts";
+import type { LSCategoryNav } from "./ls-category-nav.ts";
+import "./ls-calendar.ts";
+import type { LSCalendar } from "./ls-calendar.ts";
 import type { LSFileTree } from "./ls-file-tree.ts";
 import type { LSBacklinks } from "./ls-backlinks.ts";
 import type { LSOutline } from "./ls-outline.ts";
@@ -36,9 +40,9 @@ const style = `
     background: var(--ls-color-bg, #1a1a2e);
     color: var(--ls-color-fg, #e0e0e0);
   }
-  #sidebar {
-    width: 240px;
-    min-width: 180px;
+  #category-panel {
+    width: 280px;
+    min-width: 220px;
     max-width: 400px;
     border-right: 1px solid var(--ls-color-border, #2a2a3e);
     display: flex;
@@ -46,45 +50,45 @@ const style = `
     overflow: hidden;
     flex-shrink: 0;
     background: var(--ls-color-bg-sidebar, #16162a);
+    transition: opacity 180ms ease;
   }
-  #sidebar-nav {
-    display: flex;
-    border-bottom: 1px solid var(--ls-color-border, #2a2a3e);
+  #category-panel.dimmed { opacity: 0.5; }
+  #category-panel > .panel-content {
+    display: none;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+  #category-panel > .panel-content.active { display: flex; }
+  .panel-header {
+    padding: 10px 14px 6px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ls-color-fg-muted, #64748b);
     flex-shrink: 0;
   }
-  #sidebar-nav button {
+  .panel-top {
     flex: 1;
-    background: none;
-    border: none;
-    color: var(--ls-color-fg-muted, #64748b);
-    font-size: 11px;
-    font-family: inherit;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    padding: 6px 4px;
-    cursor: pointer;
-    border-bottom: 2px solid transparent;
-    transition: color 0.1s;
-  }
-  #sidebar-nav button:hover { color: var(--ls-color-fg, #e0e0e0); }
-  #sidebar-nav button.active {
-    color: var(--ls-color-accent, #7c6af7);
-    border-bottom-color: var(--ls-color-accent, #7c6af7);
-  }
-  #sidebar-top {
-    flex: 1;
-    overflow: hidden;
     display: flex;
     flex-direction: column;
     min-height: 0;
+    overflow: hidden;
   }
-  #sidebar-top .tab-panel { display: none; flex: 1; overflow: hidden; flex-direction: column; min-height: 0; }
-  #sidebar-top .tab-panel.active { display: flex; }
-  #sidebar-panels {
+  .panel-bottom {
     flex-shrink: 0;
     max-height: 40vh;
     overflow-y: auto;
+    border-top: 1px solid var(--ls-color-border, #2a2a3e);
+  }
+  .panel-placeholder {
+    padding: 24px 16px;
+    color: var(--ls-color-fg-muted, #64748b);
+    font-size: 12px;
+    font-style: italic;
+    text-align: center;
   }
   #main {
     flex: 1;
@@ -179,6 +183,54 @@ const style = `
   #conflict-banner button:hover { background: rgba(245,158,11,0.15); }
 `;
 
+/**
+ * Extract the YYYY-MM-DD date from a daily-note path.
+ * Supports both the current nested layout (daily/YYYY/MM/DD/events.md) and
+ * the legacy flat layout (daily/YYYY-MM-DD.md).
+ */
+function dailyDateFromPath(path: string, dailyFolder: string): string | null {
+  const prefix = dailyFolder ? `${dailyFolder}/` : "";
+  if (!path.startsWith(prefix)) return null;
+  const rel = path.slice(prefix.length);
+  const nested = /^(\d{4})\/(\d{2})\/(\d{2})\/[^/]+\.md$/.exec(rel);
+  if (nested) return `${nested[1]}-${nested[2]}-${nested[3]}`;
+  const flat = /^(\d{4}-\d{2}-\d{2})\.md$/.exec(rel);
+  if (flat) return flat[1]!;
+  return null;
+}
+
+/**
+ * Build the preferred (nested) path for a daily note.
+ */
+function dailyPathFor(date: string, dailyFolder: string): string {
+  const [year, month, day] = date.split("-");
+  const tail = `${year}/${month}/${day}/events.md`;
+  return dailyFolder ? `${dailyFolder}/${tail}` : tail;
+}
+
+/**
+ * Pull a short one-liner out of a daily note for the Upcoming/Recent lists.
+ * Returns null when the note only contains template/date-heading content, so
+ * effectively-empty notes don't clutter the events lists.
+ */
+function extractEventSummary(content: string, date: string): string | null {
+  if (!content) return null;
+  const dateHeading = `# ${date}`;
+  for (const rawLine of content.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    if (trimmed === dateHeading) continue;
+    const cleaned = trimmed
+      .replace(/^#+\s*/, "")
+      .replace(/^[-*+]\s+/, "")
+      .replace(/^>\s+/, "")
+      .replace(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g, "$1");
+    if (!cleaned) continue;
+    return cleaned.length > 80 ? cleaned.slice(0, 80) + "…" : cleaned;
+  }
+  return null;
+}
+
 export class LSApp extends HTMLElement {
   #shadow!: ShadowRoot;
   #authOverlay!: HTMLElement;
@@ -193,9 +245,16 @@ export class LSApp extends HTMLElement {
   #palette!: LSCommandPalette;
   #switcher!: LSSwitcher;
   #search!: LSSearch;
+  #categoryNav!: LSCategoryNav;
+  #categoryPanel!: HTMLElement;
+  #calendar!: LSCalendar;
+  readonly #dailyFolder = "daily";
+  #previewedCategory = "files";
+  #activeCategory: string | null = null;
   #editor: LSEditor | null = null;
   #activePath = "";
   #saveTimer: ReturnType<typeof setTimeout> | null = null;
+  #pendingContent = ""; // template content seeded into the editor when opening a not-yet-existing daily note
 
   connectedCallback(): void {
     this.#shadow = this.attachShadow({ mode: "open" });
@@ -226,6 +285,10 @@ export class LSApp extends HTMLElement {
       e.preventDefault();
       this.#newNote("").catch(console.error);
     }
+    if (mod && !e.shiftKey && (e.key === "d" || e.key === "D")) {
+      e.preventDefault();
+      this.#openDailyNote(this.#dailyDateFor(0)).catch(console.error);
+    }
   };
 
   hideAuthOverlay(): void {
@@ -235,33 +298,41 @@ export class LSApp extends HTMLElement {
   // ── Build DOM ─────────────────────────────────────────────────────────────
 
   #buildLayout(): void {
-    // Sidebar
-    const sidebar = document.createElement("div");
-    sidebar.id = "sidebar";
+    // Category nav column (wide picker or narrow rail)
+    this.#categoryNav = document.createElement("ls-category-nav") as LSCategoryNav;
+    this.#categoryNav.categories = [
+      { id: "files", label: "Files" },
+      { id: "calendar", label: "Calendar" },
+      { id: "search", label: "Search" },
+    ];
+    this.#categoryNav.previewed = this.#previewedCategory;
+    this.#categoryNav.addEventListener("category-preview", (e) => {
+      const id = (e as CustomEvent<{ id: string }>).detail.id;
+      this.#onCategoryPreview(id);
+    });
+    this.#categoryNav.addEventListener("category-drill", (e) => {
+      const id = (e as CustomEvent<{ id: string }>).detail.id;
+      this.#onCategoryDrill(id);
+    });
+    this.#categoryNav.addEventListener("rail-expand", () => this.#onRailExpand());
 
-    // Tab nav: Files | Search
-    const sidebarNav = document.createElement("div");
-    sidebarNav.id = "sidebar-nav";
-    const filesBtn = document.createElement("button");
-    filesBtn.textContent = "Files";
-    filesBtn.className = "active";
-    const searchBtn = document.createElement("button");
-    searchBtn.textContent = "Search";
-    sidebarNav.append(filesBtn, searchBtn);
-    sidebar.appendChild(sidebarNav);
+    // Category panel (second column, shows the previewed/active category's content)
+    this.#categoryPanel = document.createElement("div");
+    this.#categoryPanel.id = "category-panel";
 
-    const sidebarTop = document.createElement("div");
-    sidebarTop.id = "sidebar-top";
-
-    // Files tab panel
+    // Files panel: file tree + outline + backlinks stacked
     const filesPanel = document.createElement("div");
-    filesPanel.className = "tab-panel active";
+    filesPanel.className = "panel-content";
+    filesPanel.dataset["category"] = "files";
 
+    const filesTop = document.createElement("div");
+    filesTop.className = "panel-top";
     this.#fileTree = document.createElement("ls-file-tree") as LSFileTree;
     this.#fileTree.style.cssText = "flex:1;min-height:0;overflow:hidden;";
     this.#fileTree.addEventListener("file-open", (e) => {
       const { path } = (e as CustomEvent<{ path: string }>).detail;
       navigateTo(path);
+      this.#drillInto("files");
     });
     this.#fileTree.addEventListener("file-new", (e) => {
       const { folder } = (e as CustomEvent<{ folder: string }>).detail;
@@ -271,56 +342,60 @@ export class LSApp extends HTMLElement {
       const { oldPath, newPath } = (e as CustomEvent<{ oldPath: string; newPath: string }>).detail;
       this.#renameNote(oldPath, newPath);
     });
-    filesPanel.appendChild(this.#fileTree);
+    filesTop.appendChild(this.#fileTree);
+    filesPanel.appendChild(filesTop);
 
-    // Search tab panel
-    const searchPanel = document.createElement("div");
-    searchPanel.className = "tab-panel";
-
-    this.#search = document.createElement("ls-search") as LSSearch;
-    this.#search.style.cssText = "flex:1;min-height:0;";
-    this.#search.addEventListener("file-open", (e) => {
-      const { path } = (e as CustomEvent<{ path: string }>).detail;
-      navigateTo(path);
-      filesBtn.click(); // switch back to files tab after opening
-    });
-    searchPanel.appendChild(this.#search);
-
-    sidebarTop.append(filesPanel, searchPanel);
-    sidebar.appendChild(sidebarTop);
-
-    // Tab switching logic
-    filesBtn.addEventListener("click", () => {
-      filesBtn.className = "active";
-      searchBtn.className = "";
-      filesPanel.className = "tab-panel active";
-      searchPanel.className = "tab-panel";
-    });
-    searchBtn.addEventListener("click", () => {
-      searchBtn.className = "active";
-      filesBtn.className = "";
-      searchPanel.className = "tab-panel active";
-      filesPanel.className = "tab-panel";
-      requestAnimationFrame(() => this.#search.focus());
-    });
-
-    const sidebarPanels = document.createElement("div");
-    sidebarPanels.id = "sidebar-panels";
-
+    const filesBottom = document.createElement("div");
+    filesBottom.className = "panel-bottom";
     this.#outline = document.createElement("ls-outline") as LSOutline;
     this.#outline.addEventListener("outline-jump", (e) => {
       const { line } = (e as CustomEvent<{ line: number }>).detail;
       this.#editor?.scrollToLine(line);
     });
-
     this.#backlinks = document.createElement("ls-backlinks") as LSBacklinks;
     this.#backlinks.addEventListener("file-open", (e) => {
       const { path } = (e as CustomEvent<{ path: string }>).detail;
       navigateTo(path);
+      this.#drillInto("files");
     });
+    filesBottom.append(this.#outline, this.#backlinks);
+    filesPanel.appendChild(filesBottom);
 
-    sidebarPanels.append(this.#outline, this.#backlinks);
-    sidebar.appendChild(sidebarPanels);
+    // Calendar panel
+    const calendarPanel = document.createElement("div");
+    calendarPanel.className = "panel-content";
+    calendarPanel.dataset["category"] = "calendar";
+    this.#calendar = document.createElement("ls-calendar") as LSCalendar;
+    this.#calendar.dailyFolder = this.#dailyFolder;
+    this.#calendar.addEventListener("daily-open", (e) => {
+      const { date, path } = (e as CustomEvent<{ date: string; path: string }>).detail;
+      this.#openDailyNote(date, path).catch(console.error);
+    });
+    calendarPanel.appendChild(this.#calendar);
+
+    // Search panel
+    const searchPanel = document.createElement("div");
+    searchPanel.className = "panel-content";
+    searchPanel.dataset["category"] = "search";
+    this.#search = document.createElement("ls-search") as LSSearch;
+    this.#search.style.cssText = "flex:1;min-height:0;";
+    this.#search.addEventListener("file-open", (e) => {
+      const { path } = (e as CustomEvent<{ path: string }>).detail;
+      navigateTo(path);
+      this.#drillInto("files");
+    });
+    searchPanel.appendChild(this.#search);
+
+    this.#categoryPanel.append(filesPanel, calendarPanel, searchPanel);
+    this.#showPanel(this.#previewedCategory);
+
+    // If the panel is dimmed (rail was expanded back to picker), any click
+    // inside the panel re-drills into the currently-previewed category.
+    this.#categoryPanel.addEventListener("click", () => {
+      if (this.#categoryPanel.classList.contains("dimmed")) {
+        this.#drillInto(this.#previewedCategory);
+      }
+    }, true);
 
     // Main area
     const main = document.createElement("div");
@@ -403,10 +478,55 @@ export class LSApp extends HTMLElement {
       navigateTo(path);
     });
 
-    this.#shadow.append(sidebar, main, this.#authOverlay, this.#palette, this.#switcher);
+    this.#shadow.append(
+      this.#categoryNav,
+      this.#categoryPanel,
+      main,
+      this.#authOverlay,
+      this.#palette,
+      this.#switcher
+    );
 
     // Hash router
     window.addEventListener("route", this.#onRoute as EventListener);
+  }
+
+  // ── Category nav orchestration ────────────────────────────────────────────
+
+  #showPanel(id: string): void {
+    this.#categoryPanel.querySelectorAll<HTMLElement>(".panel-content").forEach((el) => {
+      el.classList.toggle("active", el.dataset["category"] === id);
+    });
+  }
+
+  #onCategoryPreview(id: string): void {
+    this.#previewedCategory = id;
+    this.#showPanel(id);
+    this.#categoryPanel.classList.remove("dimmed");
+    if (id === "search") requestAnimationFrame(() => this.#search.focus());
+  }
+
+  #onCategoryDrill(id: string): void {
+    this.#drillInto(id);
+  }
+
+  #onRailExpand(): void {
+    // Rail → picker with the panel dimmed until user re-commits.
+    this.#categoryNav.mode = "picker";
+    this.#categoryNav.previewed = this.#activeCategory ?? this.#previewedCategory;
+    this.#previewedCategory = this.#categoryNav.previewed;
+    this.#showPanel(this.#previewedCategory);
+    this.#categoryPanel.classList.add("dimmed");
+  }
+
+  #drillInto(id: string): void {
+    this.#activeCategory = id;
+    this.#previewedCategory = id;
+    this.#categoryNav.active = id;
+    this.#categoryNav.previewed = id;
+    this.#categoryNav.mode = "rail";
+    this.#showPanel(id);
+    this.#categoryPanel.classList.remove("dimmed");
   }
 
   #showWelcome(): void {
@@ -531,6 +651,9 @@ export class LSApp extends HTMLElement {
       this.#setStatus("ok", "Synced");
       const headOid = (e as CustomEvent).detail?.headOid as string | undefined;
       if (headOid) this.#setRepoSha(headOid);
+      // Refresh the file list — catches remote adds/removes that don't emit
+      // per-note events (reconcileFromOPFS writes directly to IndexedDB).
+      this.#loadNoteList().catch(console.error);
       // Reload active note if it changed.
       if (this.#activePath) this.#reloadActiveNote().catch(console.error);
     });
@@ -570,6 +693,21 @@ export class LSApp extends HTMLElement {
     this.#fileTree.notes = paths;
     this.#fileTree.activePath = this.#activePath;
     this.#switcher.notes = paths;
+    this.#calendar.notes = paths;
+    this.#calendar.activePath = this.#activePath;
+
+    // Collect daily-note events for the calendar's Upcoming/Recent lists.
+    const events: { date: string; summary: string; path: string }[] = [];
+    for (const path of paths) {
+      const date = dailyDateFromPath(path, this.#dailyFolder);
+      if (!date) continue;
+      const content = await vaultService.readNote(path);
+      if (!content) continue;
+      const summary = extractEventSummary(content, date);
+      if (!summary) continue;
+      events.push({ date, summary, path });
+    }
+    this.#calendar.events = events;
   }
 
   // ── Routing ───────────────────────────────────────────────────────────────
@@ -594,6 +732,7 @@ export class LSApp extends HTMLElement {
   async #openNote(path: string): Promise<void> {
     this.#activePath = path;
     this.#fileTree.activePath = path;
+    this.#calendar.activePath = path;
     this.#conflictBanner.classList.remove("visible");
 
     let content = "";
@@ -603,6 +742,14 @@ export class LSApp extends HTMLElement {
     } catch {
       content = "";
     }
+
+    // If the file doesn't exist yet and we have template content staged
+    // (from a daily-note click), seed the editor with it. The template only
+    // becomes a real file once the user starts typing.
+    if (!content && this.#pendingContent) {
+      content = this.#pendingContent;
+    }
+    this.#pendingContent = "";
 
     this.#mountEditor(path, content);
     this.#updateSidebarPanels(path, content);
@@ -651,6 +798,70 @@ export class LSApp extends HTMLElement {
     const path = folder ? `${folder}/${base}.md` : `${base}.md`;
     await vaultService.writeNote(path, `# ${base}\n\n`);
     navigateTo(path);
+  }
+
+  // ── Daily notes ───────────────────────────────────────────────────────────
+
+  #dailyDateFor(offset: number): string {
+    const d = new Date();
+    d.setDate(d.getDate() + offset);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+
+  async #openDailyNote(date: string, path?: string): Promise<void> {
+    // Caller may pass an explicit path (e.g. a legacy flat note from the
+    // calendar). Otherwise prefer the new nested layout and fall back to the
+    // legacy flat path only if a file already exists there.
+    let targetPath = path ?? dailyPathFor(date, this.#dailyFolder);
+    let existing = await vaultService.readNote(targetPath);
+    if (existing === null && !path) {
+      const legacyPath = this.#dailyFolder ? `${this.#dailyFolder}/${date}.md` : `${date}.md`;
+      const legacy = await vaultService.readNote(legacyPath);
+      if (legacy !== null) {
+        targetPath = legacyPath;
+        existing = legacy;
+      }
+    }
+
+    if (existing === null) {
+      // Seed the editor with the template but DON'T persist anything yet — the
+      // file only gets written on the first real edit. Stops the calendar from
+      // looking like empty days have content.
+      const templatePath = this.#dailyFolder ? `${this.#dailyFolder}/_template.md` : "_template.md";
+      const template = await vaultService.readNote(templatePath);
+      this.#pendingContent = template
+        ? template.replace(/\{\{date\}\}/g, date)
+        : `# ${date}\n\n`;
+    }
+    navigateTo(targetPath);
+  }
+
+  #moveActiveNote(): void {
+    if (!this.#activePath) {
+      this.#setStatus("error", "No active note to move");
+      return;
+    }
+    const newPath = prompt("Move to (full path, including .md):", this.#activePath);
+    if (!newPath || newPath === this.#activePath) return;
+    const normalized = newPath.endsWith(".md") ? newPath : `${newPath}.md`;
+    this.#renameNote(this.#activePath, normalized);
+  }
+
+  async #deleteActiveNote(): Promise<void> {
+    if (!this.#activePath) {
+      this.#setStatus("error", "No active note to delete");
+      return;
+    }
+    if (!confirm(`Delete "${this.#activePath}"? This cannot be undone.`)) return;
+    const toDelete = this.#activePath;
+    try {
+      await vaultService.deleteNote(toDelete);
+      await this.#loadNoteList();
+      navigateHome();
+    } catch (err) {
+      this.#setStatus("error", "Delete failed");
+      console.error(err);
+    }
   }
 
   #renameNote(oldPath: string, newPath: string): void {
@@ -710,6 +921,11 @@ export class LSApp extends HTMLElement {
     this.#palette.register({ id: "new-note", label: "New note", description: "Create a new note", shortcut: "Ctrl+N" });
     this.#palette.register({ id: "quick-open", label: "Quick open note", description: "Jump to a note by name", shortcut: "Ctrl+P" });
     this.#palette.register({ id: "search", label: "Search notes", description: "Full-text search across vault", shortcut: "Ctrl+Shift+F" });
+    this.#palette.register({ id: "daily-today", label: "Open today's daily note", description: "Create or open today's daily note", shortcut: "Ctrl+D" });
+    this.#palette.register({ id: "daily-yesterday", label: "Open yesterday's daily note" });
+    this.#palette.register({ id: "daily-tomorrow", label: "Open tomorrow's daily note" });
+    this.#palette.register({ id: "move-note", label: "Move active note…", description: "Change the path of the currently-open note" });
+    this.#palette.register({ id: "delete-note", label: "Delete active note", description: "Delete the currently-open note" });
     this.#palette.register({ id: "go-home", label: "Go to home", description: "Show the welcome screen" });
     this.#palette.register({ id: "sync", label: "Sync now", description: "Push and pull from GitHub" });
   }
@@ -725,6 +941,21 @@ export class LSApp extends HTMLElement {
       case "search":
         this.#openSearchTab();
         break;
+      case "daily-today":
+        this.#openDailyNote(this.#dailyDateFor(0)).catch(console.error);
+        break;
+      case "daily-yesterday":
+        this.#openDailyNote(this.#dailyDateFor(-1)).catch(console.error);
+        break;
+      case "daily-tomorrow":
+        this.#openDailyNote(this.#dailyDateFor(1)).catch(console.error);
+        break;
+      case "move-note":
+        this.#moveActiveNote();
+        break;
+      case "delete-note":
+        this.#deleteActiveNote();
+        break;
       case "go-home":
         navigateHome();
         break;
@@ -739,9 +970,8 @@ export class LSApp extends HTMLElement {
   }
 
   #openSearchTab(): void {
-    // Click the Search nav button — it handles panel swap + focus.
-    const searchBtn = this.#shadow.querySelector<HTMLButtonElement>("#sidebar-nav button:last-child");
-    searchBtn?.click();
+    this.#drillInto("search");
+    requestAnimationFrame(() => this.#search.focus());
   }
 }
 

@@ -312,9 +312,11 @@ export class SyncEngine {
   private async stageDirtyFiles(): Promise<string[]> {
     const db = await getDB();
     const staged: string[] = [];
+    const dbPaths = new Set<string>();
 
     const notes = await db.getAll("notes");
     for (const note of notes) {
+      dbPaths.add(note.path);
       if (note.syncState === "dirty") {
         // Write at-rest bytes directly to OPFS (codec already applied in StorageAdapter).
         await this.fs.promises.writeFile(`/${note.path}`, note.content);
@@ -325,6 +327,7 @@ export class SyncEngine {
 
     const canvases = await db.getAll("canvas");
     for (const canvas of canvases) {
+      dbPaths.add(canvas.path);
       if (canvas.syncState === "dirty") {
         await this.fs.promises.writeFile(`/${canvas.path}`, canvas.content);
         await git.add({ fs: this.fs, dir: GIT_DIR, filepath: canvas.path });
@@ -334,10 +337,36 @@ export class SyncEngine {
 
     const attachments = await db.getAll("attachments");
     for (const att of attachments) {
+      dbPaths.add(att.path);
       if (att.syncState === "dirty") {
         await this.fs.promises.writeFile(`/${att.path}`, att.blob);
         await git.add({ fs: this.fs, dir: GIT_DIR, filepath: att.path });
         staged.push(att.path);
+      }
+    }
+
+    // Stage deletions: any content file present in HEAD but absent from IDB
+    // was deleted locally and needs to be removed from git + OPFS so the
+    // deletion lands in the next commit.
+    const branch = this.tokens?.repoDefaultBranch ?? "main";
+    const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
+    if (headOid) {
+      const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid: headOid });
+      const fs = this.fs;
+      async function* walkTree(treeOid: string, prefix: string): AsyncGenerator<string> {
+        const { tree } = await git.readTree({ fs, dir: GIT_DIR, oid: treeOid });
+        for (const entry of tree) {
+          const entryPath = prefix ? `${prefix}/${entry.path}` : entry.path;
+          if (entry.type === "blob") yield entryPath;
+          else if (entry.type === "tree") yield* walkTree(entry.oid, entryPath);
+        }
+      }
+      for await (const filepath of walkTree(commit.tree, "")) {
+        if (!isContentFile(filepath)) continue;
+        if (dbPaths.has(filepath)) continue;
+        try { await this.fs.promises.unlink(`/${filepath}`); } catch { /* already gone */ }
+        try { await git.remove({ fs: this.fs, dir: GIT_DIR, filepath }); } catch { /* already unstaged */ }
+        staged.push(filepath);
       }
     }
 
@@ -443,56 +472,81 @@ export class SyncEngine {
   }
 
   private async reconcileFromOPFS(): Promise<void> {
-    // After a successful merge, read any files that changed in the OPFS
-    // working tree back into IndexedDB.
+    // After a successful merge/fast-forward, bring IndexedDB in line with HEAD.
+    // Walks the current tree and compares each blob's OID to the note's baseSha.
+    // Status-matrix-based detection doesn't work here because a fast-forward
+    // merge leaves workdir === HEAD for every file (nothing looks "modified").
     const db = await getDB();
-    const matrix = await git.statusMatrix({ fs: this.fs, dir: GIT_DIR });
+    const branch = this.tokens?.repoDefaultBranch ?? "main";
+    const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
+    if (!headOid) return;
+    const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid: headOid });
 
-    for (const [filepath, headStatus, workdirStatus] of matrix) {
-      // workdirStatus 2 = modified vs HEAD; headStatus 0 = new file
-      if (workdirStatus !== 1 || headStatus === 0) {
-        // File changed or is new
-        const ext = (filepath as string)
-          .slice((filepath as string).lastIndexOf("."))
-          .toLowerCase();
-
-        const bytes = await this.readOpfsFile(filepath as string);
-
-        if (ext === ".md") {
-          const existing = await db.get("notes", filepath as string);
-          const record: NoteRecord = {
-            path: filepath as string,
-            content: bytes,
-            size: bytes.length,
-            updatedAt: Date.now(),
-            frontmatter: existing?.frontmatter ?? {},
-            syncState: "clean",
-            baseSha: await this.getBlobSha(filepath as string),
-            codec: { scheme: identityCodec.scheme, version: identityCodec.version },
-          };
-          await db.put("notes", record);
-        } else if (ext === ".canvas") {
-          const existing = await db.get("canvas", filepath as string);
-          const record: CanvasRecord = {
-            path: filepath as string,
-            content: bytes,
-            updatedAt: Date.now(),
-            syncState: "clean",
-            baseSha: await this.getBlobSha(filepath as string),
-            codec: existing?.codec ?? { scheme: identityCodec.scheme, version: identityCodec.version },
-          };
-          await db.put("canvas", record);
-        }
-        // Attachments: handled similarly — omitted for brevity; same pattern.
+    const fs = this.fs;
+    async function* walkTree(treeOid: string, prefix: string): AsyncGenerator<{ path: string; oid: string }> {
+      const { tree } = await git.readTree({ fs, dir: GIT_DIR, oid: treeOid });
+      for (const entry of tree) {
+        const entryPath = prefix ? `${prefix}/${entry.path}` : entry.path;
+        if (entry.type === "blob") yield { path: entryPath, oid: entry.oid };
+        else if (entry.type === "tree") yield* walkTree(entry.oid, entryPath);
       }
     }
 
-    // Clear dirty flags on all files that were staged.
-    const notes = await db.getAll("notes");
-    for (const note of notes) {
-      if (note.syncState === "dirty") {
-        const sha = await this.getBlobSha(note.path).catch(() => "");
-        await db.put("notes", { ...note, syncState: "clean", baseSha: sha });
+    const seenPaths = new Set<string>();
+    for await (const { path, oid } of walkTree(commit.tree, "")) {
+      if (!isContentFile(path)) continue;
+      seenPaths.add(path);
+      const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
+
+      if (ext === ".md") {
+        const existing = await db.get("notes", path);
+        // Preserve local dirty edits — they'll sync on the next tick.
+        if (existing?.syncState === "dirty") continue;
+        // Content unchanged since last reconcile.
+        if (existing && existing.baseSha === oid) continue;
+
+        const bytes = await this.readOpfsFile(path);
+        const record: NoteRecord = {
+          path,
+          content: bytes,
+          size: bytes.length,
+          updatedAt: Date.now(),
+          frontmatter: existing?.frontmatter ?? {},
+          syncState: "clean",
+          baseSha: oid,
+          codec: existing?.codec ?? { scheme: identityCodec.scheme, version: identityCodec.version },
+        };
+        await db.put("notes", record);
+      } else if (ext === ".canvas") {
+        const existing = await db.get("canvas", path);
+        if (existing?.syncState === "dirty") continue;
+        if (existing && existing.baseSha === oid) continue;
+
+        const bytes = await this.readOpfsFile(path);
+        const record: CanvasRecord = {
+          path,
+          content: bytes,
+          updatedAt: Date.now(),
+          syncState: "clean",
+          baseSha: oid,
+          codec: existing?.codec ?? { scheme: identityCodec.scheme, version: identityCodec.version },
+        };
+        await db.put("canvas", record);
+      }
+    }
+
+    // Remove clean notes that no longer exist in HEAD (removed on the remote).
+    // Dirty notes are preserved — they may be new local files not yet pushed.
+    const existingNotes = await db.getAll("notes");
+    for (const note of existingNotes) {
+      if (note.syncState !== "dirty" && !seenPaths.has(note.path)) {
+        await db.delete("notes", note.path);
+      }
+    }
+    const existingCanvases = await db.getAll("canvas");
+    for (const c of existingCanvases) {
+      if (c.syncState !== "dirty" && !seenPaths.has(c.path)) {
+        await db.delete("canvas", c.path);
       }
     }
   }
