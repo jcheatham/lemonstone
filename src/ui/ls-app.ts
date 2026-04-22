@@ -188,6 +188,68 @@ const style = `
     font-family: inherit;
   }
   #conflict-banner button:hover { background: rgba(245,158,11,0.15); }
+
+  /* Mobile breadcrumb — hidden on desktop, visible at level 1+ on narrow screens. */
+  #mobile-breadcrumb {
+    display: none;
+    align-items: center;
+    gap: 2px;
+    padding: 10px 12px;
+    background: var(--ls-color-bg-sidebar, #16162a);
+    border-bottom: 1px solid var(--ls-color-border, #2a2a3e);
+    font-size: 13px;
+    flex-shrink: 0;
+  }
+  #mobile-breadcrumb .bc-segment {
+    background: none;
+    border: none;
+    color: var(--ls-color-fg, #e0e0e0);
+    cursor: pointer;
+    font: inherit;
+    padding: 4px 8px;
+    border-radius: 4px;
+    max-width: 60vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #mobile-breadcrumb .bc-segment:first-of-type {
+    color: var(--ls-color-accent, #7c6af7);
+  }
+  #mobile-breadcrumb .bc-segment:hover { background: rgba(255,255,255,0.05); }
+  #mobile-breadcrumb .bc-sep { color: var(--ls-color-fg-muted, #64748b); font-size: 14px; padding: 0 2px; }
+
+  @media (max-width: 720px) {
+    :host { flex-direction: column; }
+
+    /* Level 0 (category picker) — category nav fills viewport, everything else hidden. */
+    :host([data-mobile-level="0"]) ls-category-nav {
+      width: 100%;
+      max-width: none;
+      min-width: 0;
+      height: 100%;
+      border-right: none;
+    }
+    :host([data-mobile-level="0"]) #category-panel { display: none; }
+    :host([data-mobile-level="0"]) #main { display: none; }
+
+    /* Level 1 (drilled but no content) — breadcrumb + category panel full-width. */
+    :host([data-mobile-level="1"]) ls-category-nav { display: none; }
+    :host([data-mobile-level="1"]) #category-panel {
+      width: 100%;
+      max-width: none;
+      min-width: 0;
+      border-right: none;
+    }
+    :host([data-mobile-level="1"]) #main { display: none; }
+    :host([data-mobile-level="1"]) #mobile-breadcrumb { display: flex; }
+
+    /* Level 2 (content open) — breadcrumb + main pane full-width. */
+    :host([data-mobile-level="2"]) ls-category-nav,
+    :host([data-mobile-level="2"]) #category-panel { display: none; }
+    :host([data-mobile-level="2"]) #main { width: 100%; }
+    :host([data-mobile-level="2"]) #mobile-breadcrumb { display: flex; }
+  }
 `;
 
 /**
@@ -254,6 +316,7 @@ export class LSApp extends HTMLElement {
   #search!: LSSearch;
   #categoryNav!: LSCategoryNav;
   #categoryPanel!: HTMLElement;
+  #mobileBreadcrumb!: HTMLElement;
   #calendar!: LSCalendar;
   #history!: LSHistory;
   #activeCommitOid = "";
@@ -317,10 +380,6 @@ export class LSApp extends HTMLElement {
       { id: "history", label: "History" },
     ];
     this.#categoryNav.previewed = this.#previewedCategory;
-    this.#categoryNav.addEventListener("category-preview", (e) => {
-      const id = (e as CustomEvent<{ id: string }>).detail.id;
-      this.#onCategoryPreview(id);
-    });
     this.#categoryNav.addEventListener("category-drill", (e) => {
       const id = (e as CustomEvent<{ id: string }>).detail.id;
       this.#onCategoryDrill(id);
@@ -505,7 +564,11 @@ export class LSApp extends HTMLElement {
       navigateTo(path);
     });
 
+    this.#mobileBreadcrumb = document.createElement("div");
+    this.#mobileBreadcrumb.id = "mobile-breadcrumb";
+
     this.#shadow.append(
+      this.#mobileBreadcrumb,
       this.#categoryNav,
       this.#categoryPanel,
       main,
@@ -513,6 +576,8 @@ export class LSApp extends HTMLElement {
       this.#palette,
       this.#switcher
     );
+
+    this.#updateMobileState();
 
     // Hash router
     window.addEventListener("route", this.#onRoute as EventListener);
@@ -526,14 +591,6 @@ export class LSApp extends HTMLElement {
     });
   }
 
-  #onCategoryPreview(id: string): void {
-    this.#previewedCategory = id;
-    this.#showPanel(id);
-    this.#categoryPanel.classList.remove("dimmed");
-    if (id === "search") requestAnimationFrame(() => this.#search.focus());
-    if (id === "history") this.#loadHistory().catch(console.error);
-  }
-
   #onCategoryDrill(id: string): void {
     this.#drillInto(id);
   }
@@ -545,6 +602,7 @@ export class LSApp extends HTMLElement {
     this.#previewedCategory = this.#categoryNav.previewed;
     this.#showPanel(this.#previewedCategory);
     this.#categoryPanel.classList.add("dimmed");
+    this.#updateMobileState();
   }
 
   #drillInto(id: string): void {
@@ -555,6 +613,81 @@ export class LSApp extends HTMLElement {
     this.#categoryNav.mode = "rail";
     this.#showPanel(id);
     this.#categoryPanel.classList.remove("dimmed");
+    // Category-specific activation that used to live in the preview handler:
+    if (id === "search") requestAnimationFrame(() => this.#search.focus());
+    if (id === "history") this.#loadHistory().catch(console.error);
+    this.#updateMobileState();
+  }
+
+  // ── Mobile drill-down state ──────────────────────────────────────────────
+
+  #currentLeafLabel(): string | null {
+    if (this.#activePath) {
+      return this.#activePath.split("/").pop() ?? this.#activePath;
+    }
+    if (this.#activeCommitOid && this.#categoryNav.active === "history") {
+      return this.#activeCommitOid.slice(0, 7);
+    }
+    return null;
+  }
+
+  #updateMobileState(): void {
+    if (!this.#mobileBreadcrumb) return;
+    let level = 0;
+    if (this.#categoryNav.mode === "rail") level = 1;
+    if (this.#currentLeafLabel()) level = 2;
+    this.dataset["mobileLevel"] = String(level);
+    this.#renderMobileBreadcrumb();
+  }
+
+  #renderMobileBreadcrumb(): void {
+    const bc = this.#mobileBreadcrumb;
+    bc.replaceChildren();
+    const activeId = this.#categoryNav.active;
+    if (!activeId) return;
+
+    const cat = this.#categoryNav.categories.find((c) => c.id === activeId);
+    const catLabel = cat?.label ?? activeId;
+
+    const catBtn = document.createElement("button");
+    catBtn.className = "bc-segment";
+    catBtn.textContent = catLabel;
+    catBtn.title = `Back to ${catLabel}`;
+    catBtn.addEventListener("click", () => this.#mobileUnwindTo(0));
+    bc.appendChild(catBtn);
+
+    const leaf = this.#currentLeafLabel();
+    if (leaf) {
+      const sep = document.createElement("span");
+      sep.className = "bc-sep";
+      sep.textContent = "›";
+      bc.appendChild(sep);
+
+      const leafBtn = document.createElement("button");
+      leafBtn.className = "bc-segment";
+      leafBtn.textContent = leaf;
+      leafBtn.title = `Back to ${catLabel}`;
+      leafBtn.addEventListener("click", () => this.#mobileUnwindTo(1));
+      bc.appendChild(leafBtn);
+    }
+  }
+
+  /** Go back to a given mobile level by undoing the state that drove above it. */
+  #mobileUnwindTo(level: number): void {
+    // Always clear content-level state first.
+    if (this.#activePath || this.#activeCommitOid) {
+      this.#activeCommitOid = "";
+      if (this.#activePath) navigateHome();
+      else this.#showWelcome();
+    }
+    if (level <= 0) {
+      // Also undrill back to picker.
+      this.#categoryNav.mode = "picker";
+      this.#categoryNav.active = null;
+      this.#activeCategory = null;
+      this.#categoryPanel.classList.remove("dimmed");
+    }
+    this.#updateMobileState();
   }
 
   #showWelcome(): void {
@@ -669,6 +802,7 @@ export class LSApp extends HTMLElement {
     this.#activePath = "";
     this.#fileTree.activePath = "";
     this.#calendar.activePath = "";
+    this.#updateMobileState();
 
     const details = await vaultService.commitDetails(oid);
     if (!details) {
@@ -1088,9 +1222,19 @@ export class LSApp extends HTMLElement {
       this.#outline.headings = [];
       this.#backlinks.links = [];
       this.#conflictBanner.classList.remove("visible");
+      this.#updateMobileState();
       return;
     }
     await this.#openNote(route.path);
+    // Route-driven opens (deep links, palette quick-open, switcher picks, daily
+    // notes opened from calendar) don't drill into a category by themselves.
+    // Default-drill into Files so the mobile breadcrumb has a valid ancestor
+    // to render. #drillInto() updates mobile state internally.
+    if (!this.#categoryNav.active) {
+      this.#drillInto("files");
+    } else {
+      this.#updateMobileState();
+    }
   }
 
   async #openNote(path: string): Promise<void> {

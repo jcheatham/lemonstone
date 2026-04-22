@@ -1,22 +1,21 @@
 // <ls-category-nav> — drill-down category selector column.
 //
 // Modes:
-//   picker — wide column with a row per category; the previewed row is selected.
-//            Clicking a different category swaps the preview. Clicking the
-//            already-previewed category (or pressing Enter) drills in.
+//   picker — wide column with a row per category. Clicking any row drills
+//            in immediately and the column collapses to the rail.
 //   rail   — narrow vertical strip showing the active category with rotated
 //            text. Clicking the rail returns to picker mode.
 //
 // Properties:
-//   categories  — Category[] (id + label + optional icon)
+//   categories  — Category[] (id + label)
 //   mode        — "picker" | "rail"
-//   previewed   — id of the category currently in preview (picker mode)
+//   previewed   — id of the category to visually highlight in picker (usually
+//                 the last-active category, for when the rail expands back)
 //   active      — id of the category last drilled into (rail mode source)
 //
 // Events (bubbles, composed):
-//   category-preview — detail: { id }  user selected a new category in picker
-//   category-drill   — detail: { id }  user committed to a category
-//   rail-expand      — user clicked the rail; caller should switch mode
+//   category-drill — detail: { id }  user committed to a category
+//   rail-expand    — user clicked the rail; caller should switch mode
 
 export interface Category {
   id: string;
@@ -190,17 +189,15 @@ export class LSCategoryNav extends HTMLElement {
   }
 
   #onRowClick(id: string): void {
-    if (id === this.#previewed) {
-      this.dispatchEvent(
-        new CustomEvent("category-drill", { bubbles: true, composed: true, detail: { id } })
-      );
-    } else {
-      this.#previewed = id;
-      this.#render();
-      this.dispatchEvent(
-        new CustomEvent("category-preview", { bubbles: true, composed: true, detail: { id } })
-      );
-    }
+    // Single click drills in immediately — consistent behavior across
+    // desktop and mobile. Update the internal "previewed" state so the
+    // parent's re-render shows the right highlight if the rail is
+    // subsequently expanded back to the picker.
+    this.#previewed = id;
+    this.#render();
+    this.dispatchEvent(
+      new CustomEvent("category-drill", { bubbles: true, composed: true, detail: { id } })
+    );
   }
 
   #onRowKey(e: KeyboardEvent, id: string): void {
