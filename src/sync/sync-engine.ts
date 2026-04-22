@@ -148,6 +148,74 @@ export class SyncEngine {
     }
   }
 
+  // ── Force pull / force push (escape hatches) ─────────────────────────────
+
+  /**
+   * Discard everything local and rebuild from remote:
+   *   1. wipe IDB content stores (notes/canvas/attachments/tombstones)
+   *   2. delete the OPFS git dir so clone() starts fresh
+   *   3. clone from remote + populateIndexedDB
+   * Auth tokens and config are preserved.
+   */
+  async forcePull(): Promise<void> {
+    emit({ event: "syncStarted", data: { op: "forcePull" } });
+    const db = await getDB();
+    await Promise.all([
+      db.clear("notes"),
+      db.clear("canvas"),
+      db.clear("attachments"),
+      db.clear("tombstones"),
+    ]);
+    // Remove the OPFS git dir so isInitialized() returns false and clone() runs.
+    try {
+      const storageRoot = await navigator.storage.getDirectory();
+      await storageRoot.removeEntry("lemonstone-git", { recursive: true });
+    } catch { /* not present — that's fine */ }
+    // Re-init the adapter so it points at a fresh directory.
+    this.fs = await createGitFS();
+    await this.clone();
+  }
+
+  /**
+   * Overwrite the remote branch with local state, regardless of divergence.
+   * Dangerous — any commits on remote not present locally are lost. Called
+   * only after an explicit user confirmation at the UI layer.
+   */
+  async forcePush(): Promise<void> {
+    emit({ event: "syncStarted", data: { op: "forcePush" } });
+    const tokens = await this.getValidTokens();
+    const http = this.makeHttp();
+    const authHeaders = this.makeAuthHeaders(tokens);
+    const branch = tokens.repoDefaultBranch;
+
+    // Stage anything dirty + committed tombstones so local reflects IDB.
+    const staged = await this.stageDirtyFiles();
+    if (staged.length > 0) {
+      const author = await this.getAuthor(tokens);
+      await git.commit({
+        fs: this.fs,
+        dir: GIT_DIR,
+        message: this.buildCommitMessage(staged),
+        author,
+      });
+    }
+
+    await git.push({
+      fs: this.fs,
+      http,
+      corsProxy: GIT_CORS_PROXY,
+      dir: GIT_DIR,
+      remote: "origin",
+      remoteRef: branch,
+      force: true,
+      headers: authHeaders,
+    });
+    await this.markStagedClean(staged);
+
+    const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
+    emit({ event: "syncCompleted", data: { op: "forcePush", headOid } });
+  }
+
   // ── Steady-state sync ──────────────────────────────────────────────────────
 
   async sync(): Promise<void> {
@@ -521,7 +589,8 @@ export class SyncEngine {
         // Content unchanged since last reconcile.
         if (existing && existing.baseSha === oid) continue;
 
-        const bytes = await this.readOpfsFile(path);
+        const bytes = await this.readBlobBytes(oid);
+        if (!bytes) continue;
         const record: NoteRecord = {
           path,
           content: bytes,
@@ -538,7 +607,8 @@ export class SyncEngine {
         if (existing?.syncState === "dirty") continue;
         if (existing && existing.baseSha === oid) continue;
 
-        const bytes = await this.readOpfsFile(path);
+        const bytes = await this.readBlobBytes(oid);
+        if (!bytes) continue;
         const record: CanvasRecord = {
           path,
           content: bytes,
@@ -590,7 +660,8 @@ export class SyncEngine {
 
     for await (const { path, oid } of walkTree(commit.tree, "", this.fs)) {
       if (!isContentFile(path)) continue;
-      const bytes = await this.readOpfsFile(path);
+      const bytes = await this.readBlobBytes(oid);
+      if (!bytes) continue;
       const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
 
       if (ext === ".md") {
@@ -622,6 +693,23 @@ export class SyncEngine {
   private async readOpfsFile(filepath: string): Promise<Uint8Array> {
     const data = await this.fs.promises.readFile(`/${filepath}`);
     return typeof data === "string" ? new TextEncoder().encode(data) : data;
+  }
+
+  /**
+   * Read a blob's bytes directly from git's object store by OID. More reliable
+   * than reading the working tree: survives partial merges, half-checked-out
+   * states, or any scenario where OPFS is out of sync with git's index.
+   * Returns null if the blob can't be read (shouldn't happen after a fetch,
+   * but log and skip rather than aborting the whole sync).
+   */
+  private async readBlobBytes(oid: string): Promise<Uint8Array | null> {
+    try {
+      const { blob } = await git.readBlob({ fs: this.fs, dir: GIT_DIR, oid });
+      return blob;
+    } catch (err) {
+      console.warn("[sync] could not read blob", oid, err);
+      return null;
+    }
   }
 
   private async getBlobSha(filepath: string): Promise<string> {

@@ -4,7 +4,9 @@ export type SyncOp =
   | "clone"
   | "sync"
   | "getStatus"
-  | "resolveConflict";
+  | "resolveConflict"
+  | "forcePull"
+  | "forcePush";
 
 export interface WorkerRequest {
   id: string;

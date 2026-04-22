@@ -33,6 +33,9 @@ vi.mock("../src/storage/storage-adapter.ts", () => ({
     async readAttachment() { return null; }
     async readIndexesSnapshot() { return null; }
     async writeIndexesSnapshot() {}
+    async writeTombstone() {}
+    async deleteTombstone() {}
+    async listTombstones() { return []; }
   },
 }));
 

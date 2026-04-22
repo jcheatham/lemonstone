@@ -64,6 +64,18 @@ self.addEventListener("message", async (e: MessageEvent<WorkerRequest>) => {
         break;
       }
 
+      case "forcePull": {
+        await engine.forcePull();
+        self.postMessage(ok(id));
+        break;
+      }
+
+      case "forcePush": {
+        await engine.forcePush();
+        self.postMessage(ok(id));
+        break;
+      }
+
       default: {
         self.postMessage(
           err(id, "UNKNOWN_OP", `Unknown op: ${op as string}`, false)

@@ -1,6 +1,5 @@
 import { StorageAdapter } from "../storage/storage-adapter.ts";
 import { identityCodec } from "../codec/index.ts";
-import { getDB } from "../storage/db.ts";
 import type { NoteRecord } from "../storage/schema.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
 import { extractAllTags } from "./tags.ts";
@@ -311,8 +310,7 @@ export class VaultService extends EventTarget {
   }
 
   private async markTombstone(path: string): Promise<void> {
-    const db = await getDB();
-    await db.put("tombstones", { path, deletedAt: Date.now() });
+    await this.storage.writeTombstone(path);
   }
 
   async renameCanvas(oldPath: string, newPath: string): Promise<void> {
@@ -320,6 +318,16 @@ export class VaultService extends EventTarget {
     if (content === null) throw new Error(`Canvas not found: ${oldPath}`);
     await this.writeCanvas(newPath, content);
     await this.deleteCanvas(oldPath);
+  }
+
+  // ── Force pull / push (discards local or remote state — destructive) ───
+
+  async forcePull(): Promise<void> {
+    await this.syncClient.call("forcePull");
+  }
+
+  async forcePush(): Promise<void> {
+    await this.syncClient.call("forcePush");
   }
 
   // ── Attachment API ──────────────────────────────────────────────────────────

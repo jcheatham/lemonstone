@@ -5,6 +5,7 @@ import type {
   AttachmentRecord,
   IndexesSnapshotRecord,
   ConfigRecord,
+  Tombstone,
 } from "./schema.ts";
 import type { ContentCodec } from "../codec/index.ts";
 
@@ -181,5 +182,23 @@ export class StorageAdapter {
     const db = await getDB();
     const record: ConfigRecord = { key, value };
     await db.put("config", record);
+  }
+
+  // ── Tombstones ─────────────────────────────────────────────────────────────
+
+  async writeTombstone(path: string): Promise<void> {
+    const db = await getDB();
+    const record: Tombstone = { path, deletedAt: Date.now() };
+    await db.put("tombstones", record);
+  }
+
+  async deleteTombstone(path: string): Promise<void> {
+    const db = await getDB();
+    await db.delete("tombstones", path);
+  }
+
+  async listTombstones(): Promise<Tombstone[]> {
+    const db = await getDB();
+    return db.getAll("tombstones");
   }
 }

@@ -935,6 +935,44 @@ export class LSApp extends HTMLElement {
       });
   }
 
+  async #forcePull(): Promise<void> {
+    const ok = confirm(
+      "Force pull will discard ALL local changes and re-download everything from GitHub.\n\n" +
+      "Any unsaved notes, pending commits, and unsent edits will be lost.\n\n" +
+      "Continue?"
+    );
+    if (!ok) return;
+    this.#setStatus("syncing", "Force-pulling…");
+    try {
+      await vaultService.forcePull();
+      await this.#loadNoteList();
+      navigateHome();
+      this.#setStatus("ok", "Synced");
+      getToast().show("Local vault reset to match remote.", "success", 4000);
+    } catch (err) {
+      this.#setStatus("error", "Force pull failed");
+      console.error(err);
+    }
+  }
+
+  async #forcePush(): Promise<void> {
+    const ok = confirm(
+      "Force push will overwrite the remote branch with your local state.\n\n" +
+      "Any commits on GitHub that aren't already in your local copy will be lost.\n\n" +
+      "Continue?"
+    );
+    if (!ok) return;
+    this.#setStatus("syncing", "Force-pushing…");
+    try {
+      await vaultService.forcePush();
+      this.#setStatus("ok", "Synced");
+      getToast().show("Remote overwritten with local state.", "success", 4000);
+    } catch (err) {
+      this.#setStatus("error", "Force push failed");
+      console.error(err);
+    }
+  }
+
   async #showStorageQuota(): Promise<void> {
     if (!navigator.storage?.estimate) {
       getToast().show("Storage quota API not supported in this browser.", "warning", 5000);
@@ -1045,6 +1083,8 @@ export class LSApp extends HTMLElement {
     this.#palette.register({ id: "delete-note", label: "Delete active note", description: "Delete the currently-open note" });
     this.#palette.register({ id: "install-app", label: "Install Lemonstone", description: "Install as a PWA on this device" });
     this.#palette.register({ id: "storage-quota", label: "Show storage quota", description: "How much browser storage the vault is using" });
+    this.#palette.register({ id: "force-pull", label: "Force pull from remote (discard local changes)", description: "Wipe local cache and re-download everything from GitHub" });
+    this.#palette.register({ id: "force-push", label: "Force push to remote (overwrite remote changes)", description: "Push local state to GitHub, discarding any commits that aren't in your local copy" });
     this.#palette.register({ id: "go-home", label: "Go to home", description: "Show the welcome screen" });
     this.#palette.register({ id: "sync", label: "Sync now", description: "Push and pull from GitHub" });
   }
@@ -1091,6 +1131,12 @@ export class LSApp extends HTMLElement {
         break;
       case "storage-quota":
         this.#showStorageQuota().catch(console.error);
+        break;
+      case "force-pull":
+        this.#forcePull().catch(console.error);
+        break;
+      case "force-push":
+        this.#forcePush().catch(console.error);
         break;
       case "go-home":
         navigateHome();
