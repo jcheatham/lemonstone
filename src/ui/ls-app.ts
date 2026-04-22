@@ -255,6 +255,7 @@ export class LSApp extends HTMLElement {
   #activePath = "";
   #saveTimer: ReturnType<typeof setTimeout> | null = null;
   #pendingContent = ""; // template content seeded into the editor when opening a not-yet-existing daily note
+  #lastLoadedContent = ""; // content baseline for the active note — reload is safe only while editor matches this
 
   connectedCallback(): void {
     this.#shadow = this.attachShadow({ mode: "open" });
@@ -556,6 +557,7 @@ export class LSApp extends HTMLElement {
     });
     this.#editorWrap.appendChild(ed);
     this.#editor = ed;
+    this.#lastLoadedContent = content;
     requestAnimationFrame(() => ed.focus());
   }
 
@@ -757,12 +759,19 @@ export class LSApp extends HTMLElement {
 
   async #reloadActiveNote(): Promise<void> {
     if (!this.#activePath || !this.#editor) return;
+    // A debounced save is in flight — IDB is older than the editor, and
+    // reading it back would destroy whatever the user just typed and reset
+    // the cursor to position 0. Wait for the save to land.
+    if (this.#saveTimer) return;
     try {
       const note = await vaultService.readNote(this.#activePath);
-      if (note !== null && note !== this.#editor.value) {
-        this.#editor.value = note;
-        this.#updateSidebarPanels(this.#activePath, note);
-      }
+      if (note === null || note === this.#editor.value) return;
+      // Editor has diverged from the last baseline we loaded — the user has
+      // unsaved edits. Don't clobber them even if IDB has newer content.
+      if (this.#editor.value !== this.#lastLoadedContent) return;
+      this.#editor.value = note;
+      this.#lastLoadedContent = note;
+      this.#updateSidebarPanels(this.#activePath, note);
     } catch { /* ignore */ }
   }
 
@@ -782,6 +791,11 @@ export class LSApp extends HTMLElement {
       this.#saveTimer = null;
       try {
         await vaultService.writeNote(path, content);
+        // Only advance the baseline if the editor hasn't moved on since this
+        // save fired. If it has, the next save tick handles it.
+        if (this.#editor && this.#editor.value === content) {
+          this.#lastLoadedContent = content;
+        }
         this.#setStatus("ok", "Saved");
         this.#updateSidebarPanels(path, content);
       } catch (err) {
