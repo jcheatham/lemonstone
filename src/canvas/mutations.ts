@@ -129,6 +129,22 @@ export function getEdgesForNode(doc: CanvasDocument, id: string): CanvasEdge[] {
 }
 
 /**
+ * Union-merge two canvases for "keep both" conflict resolution.
+ * Nodes and edges from `a` win on ID collisions — random UUID IDs make
+ * collisions vanishingly rare in practice, but if the same node was edited
+ * on both sides, the local version is preserved.
+ */
+export function mergeCanvases(a: CanvasDocument, b: CanvasDocument): CanvasDocument {
+  const nodeIds = new Set(a.nodes.map((n) => n.id));
+  const edgeIds = new Set(a.edges.map((e) => e.id));
+  return {
+    ...a,
+    nodes: [...a.nodes, ...b.nodes.filter((n) => !nodeIds.has(n.id))],
+    edges: [...a.edges, ...b.edges.filter((e) => !edgeIds.has(e.id))],
+  };
+}
+
+/**
  * Bounding box of a set of nodes (or all nodes if ids is omitted). Returns
  * null if there are no matching nodes.
  */

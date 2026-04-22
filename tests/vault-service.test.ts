@@ -28,6 +28,8 @@ vi.mock("../src/storage/storage-adapter.ts", () => ({
     }
     async writeCanvas() {}
     async readCanvas() { return null; }
+    async readCanvasRecord() { return null; }
+    async clearCanvasConflict() {}
     async deleteCanvas() {}
     async writeAttachment() {}
     async readAttachment() { return null; }

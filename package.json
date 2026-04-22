@@ -33,6 +33,7 @@
     "codemirror": "^6.0.2",
     "idb": "^8.0.3",
     "isomorphic-git": "^1.37.5",
+    "marked": "^18.0.2",
     "minisearch": "^7.2.0"
   }
 }

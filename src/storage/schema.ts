@@ -36,6 +36,12 @@ export interface CanvasRecord {
   syncState: SyncState;
   baseSha: string;
   codec: CodecDescriptor;
+  /**
+   * When syncState === "conflict", this holds the remote version's bytes so
+   * the UI can present "keep mine / keep theirs / keep both". `content` still
+   * holds our (local) version.
+   */
+  conflict?: { theirs: Uint8Array };
 }
 
 export interface AttachmentRecord {

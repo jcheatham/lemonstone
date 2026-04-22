@@ -72,6 +72,9 @@ export class LSSwitcher extends HTMLElement {
   #shadow: ShadowRoot;
   #input!: HTMLInputElement;
   #list!: HTMLElement;
+  /** When set, selections resolve this promise instead of firing file-open. */
+  #pickResolver: ((path: string | null) => void) | null = null;
+  #defaultPlaceholder = "Jump to note…";
 
   constructor() {
     super();
@@ -94,14 +97,40 @@ export class LSSwitcher extends HTMLElement {
   set notes(v: string[]) { this.#notes = v; }
 
   open(): void {
+    this.#input.placeholder = this.#defaultPlaceholder;
     this.#input.value = "";
     this.#filter("");
     this.classList.add("open");
     requestAnimationFrame(() => this.#input.focus());
   }
 
+  /**
+   * Open the switcher in "pick" mode. Instead of dispatching file-open on
+   * selection, returns a Promise that resolves with the picked path (or null
+   * if the user closed without choosing).
+   */
+  pick(options: { placeholder?: string } = {}): Promise<string | null> {
+    // If there's already a pending pick, cancel it.
+    if (this.#pickResolver) {
+      this.#pickResolver(null);
+      this.#pickResolver = null;
+    }
+    return new Promise<string | null>((resolve) => {
+      this.#pickResolver = resolve;
+      this.#input.placeholder = options.placeholder ?? "Pick a note…";
+      this.#input.value = "";
+      this.#filter("");
+      this.classList.add("open");
+      requestAnimationFrame(() => this.#input.focus());
+    });
+  }
+
   close(): void {
     this.classList.remove("open");
+    if (this.#pickResolver) {
+      this.#pickResolver(null);
+      this.#pickResolver = null;
+    }
   }
 
   // ── Private ───────────────────────────────────────────────────────────────
@@ -193,7 +222,13 @@ export class LSSwitcher extends HTMLElement {
   #select(index: number): void {
     const path = this.#filtered[index];
     if (!path) return;
-    this.close();
+    const resolver = this.#pickResolver;
+    this.#pickResolver = null;
+    this.classList.remove("open");
+    if (resolver) {
+      resolver(path);
+      return;
+    }
     this.dispatchEvent(
       new CustomEvent("file-open", {
         bubbles: true,

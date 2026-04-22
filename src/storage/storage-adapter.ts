@@ -90,6 +90,20 @@ export class StorageAdapter {
     return decoder.decode(decoded);
   }
 
+  async readCanvasRecord(path: string): Promise<CanvasRecord | null> {
+    const db = await getDB();
+    return (await db.get("canvas", path)) ?? null;
+  }
+
+  async clearCanvasConflict(path: string): Promise<void> {
+    const db = await getDB();
+    const record = await db.get("canvas", path);
+    if (!record) return;
+    const { conflict: _conflict, ...rest } = record;
+    void _conflict;
+    await db.put("canvas", { ...rest, syncState: "clean" });
+  }
+
   async listCanvas(): Promise<CanvasRecord[]> {
     const db = await getDB();
     return db.getAll("canvas");

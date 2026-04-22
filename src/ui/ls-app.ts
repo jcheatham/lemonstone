@@ -24,7 +24,7 @@ import "./ls-calendar.ts";
 import type { LSCalendar } from "./ls-calendar.ts";
 import "./ls-canvas.ts";
 import type { LSCanvas } from "./ls-canvas.ts";
-import { parseCanvas, serializeCanvas, emptyCanvas } from "../canvas/index.ts";
+import { parseCanvas, serializeCanvas, emptyCanvas, mergeCanvases } from "../canvas/index.ts";
 import { canInstall, triggerInstall } from "../pwa.ts";
 import { getToast } from "./ls-toast.ts";
 import type { LSFileTree } from "./ls-file-tree.ts";
@@ -549,20 +549,34 @@ export class LSApp extends HTMLElement {
   }
 
   async #openCanvas(path: string): Promise<void> {
-    let text = "";
-    try {
-      const existing = await vaultService.readCanvas(path);
-      text = existing ?? "";
-    } catch { text = ""; }
+    const record = await vaultService.readCanvasRecord(path);
+    const text = record?.content ? new TextDecoder().decode(record.content) : "";
     const doc = text ? parseCanvas(text) : emptyCanvas();
+    const inConflict = record?.syncState === "conflict" && !!record.conflict;
 
     this.#editorWrap.innerHTML = "";
     const canvas = document.createElement("ls-canvas") as LSCanvas;
     canvas.style.cssText = "display:block;height:100%;width:100%;";
     canvas.document = doc;
+    canvas.setConflict(inConflict);
     canvas.addEventListener("canvas-change", (e) => {
       const nextDoc = (e as CustomEvent<{ document: unknown }>).detail.document as ReturnType<typeof parseCanvas>;
       this.#saveCanvasDebounced(path, nextDoc);
+    });
+    canvas.addEventListener("canvas-resolve-conflict", (e) => {
+      const choice = (e as CustomEvent<{ choice: "mine" | "theirs" | "both" }>).detail.choice;
+      this.#resolveCanvasConflict(path, choice).catch(console.error);
+    });
+    canvas.addEventListener("file-open", (e) => {
+      const target = (e as CustomEvent<{ path: string }>).detail.path;
+      if (target) navigateTo(target);
+    });
+    canvas.addEventListener("request-file-pick", () => {
+      this.#switcher.pick({ placeholder: "Pick a file for this node…" })
+        .then((picked) => {
+          if (picked) canvas.insertFileNodeAtCenter(picked);
+        })
+        .catch(console.error);
     });
     this.#editorWrap.appendChild(canvas);
     this.#editor = null;
@@ -574,6 +588,28 @@ export class LSApp extends HTMLElement {
     this.#backlinks.links = vaultService.getBacklinks(path);
 
     this.#lastLoadedContent = serializeCanvas(doc);
+  }
+
+  async #resolveCanvasConflict(path: string, choice: "mine" | "theirs" | "both"): Promise<void> {
+    const record = await vaultService.readCanvasRecord(path);
+    if (!record || !record.conflict) return;
+
+    const ours = parseCanvas(new TextDecoder().decode(record.content));
+    const theirs = parseCanvas(new TextDecoder().decode(record.conflict.theirs));
+    let resolved;
+    switch (choice) {
+      case "mine":   resolved = ours; break;
+      case "theirs": resolved = theirs; break;
+      case "both":   resolved = mergeCanvases(ours, theirs); break;
+    }
+    const serialized = serializeCanvas(resolved);
+    await vaultService.writeCanvas(path, serialized);
+    // writeCanvas doesn't clear the conflict field — do it explicitly so
+    // future opens of the file don't re-surface the banner.
+    await vaultService.clearCanvasConflict(path);
+    this.#setStatus("ok", "Conflict resolved");
+    // Reload the canvas view from the new state.
+    await this.#openCanvas(path);
   }
 
   #saveCanvasDebounced(path: string, doc: ReturnType<typeof parseCanvas>): void {
@@ -1074,6 +1110,7 @@ export class LSApp extends HTMLElement {
   #registerCommands(): void {
     this.#palette.register({ id: "new-note", label: "New note", description: "Create a new note", shortcut: "Ctrl+N" });
     this.#palette.register({ id: "new-canvas", label: "New canvas", description: "Create a new JSON Canvas file" });
+    this.#palette.register({ id: "canvas-edit-text", label: "Canvas: edit selected text node", description: "Enter edit mode on a selected text node (fallback for when double-click fails)" });
     this.#palette.register({ id: "quick-open", label: "Quick open note", description: "Jump to a note by name", shortcut: "Ctrl+P" });
     this.#palette.register({ id: "search", label: "Search notes", description: "Full-text search across vault", shortcut: "Ctrl+Shift+F" });
     this.#palette.register({ id: "daily-today", label: "Open today's daily note", description: "Create or open today's daily note", shortcut: "Ctrl+D" });
@@ -1097,6 +1134,17 @@ export class LSApp extends HTMLElement {
       case "new-canvas":
         this.#newCanvas().catch(console.error);
         break;
+      case "canvas-edit-text": {
+        const canvas = this.#editorWrap.querySelector("ls-canvas") as LSCanvas | null;
+        if (!canvas) {
+          getToast().show("No canvas is open.", "info", 3000);
+          break;
+        }
+        if (!canvas.beginEditSelectedText()) {
+          getToast().show("Select a text node first.", "info", 3000);
+        }
+        break;
+      }
       case "quick-open":
         this.#switcher.open();
         break;

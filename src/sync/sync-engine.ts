@@ -540,6 +540,25 @@ export class SyncEngine {
         });
       }
       conflictPaths.push(filepath, conflictPath);
+    } else if (filepath.endsWith(".canvas")) {
+      // Canvas files can't use conflict markers (would break JSON parsing),
+      // so instead we stash both sides and surface a resolution UI.
+      const canvas = await db.get("canvas", filepath);
+      if (!canvas) return;
+      const branch = this.tokens?.repoDefaultBranch ?? "main";
+      const ours = await this.readBlobAt(`refs/heads/${branch}`, filepath);
+      const theirs = await this.readBlobAt(`refs/remotes/origin/${branch}`, filepath);
+      if (!ours || !theirs) {
+        console.warn("[sync] canvas conflict: could not read ours/theirs blobs", filepath);
+        return;
+      }
+      await db.put("canvas", {
+        ...canvas,
+        content: ours,
+        syncState: "conflict" as SyncState,
+        conflict: { theirs },
+      });
+      conflictPaths.push(filepath);
     } else {
       // v1 identity codec: 3-way merge with conflict markers.
       const conflictContent = await this.readOpfsFile(filepath);
@@ -552,6 +571,25 @@ export class SyncEngine {
         });
         conflictPaths.push(filepath);
       }
+    }
+  }
+
+  /** Read a file's blob bytes from a specific ref (branch / remote branch). */
+  private async readBlobAt(ref: string, filepath: string): Promise<Uint8Array | null> {
+    try {
+      const oid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref });
+      const commit = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid });
+      // readBlob can take a commit oid + filepath and walk the tree.
+      const { blob } = await git.readBlob({
+        fs: this.fs,
+        dir: GIT_DIR,
+        oid: commit.commit.tree,
+        filepath,
+      });
+      return blob;
+    } catch (err) {
+      console.warn("[sync] readBlobAt failed", ref, filepath, err);
+      return null;
     }
   }
 

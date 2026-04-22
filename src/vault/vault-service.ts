@@ -289,6 +289,14 @@ export class VaultService extends EventTarget {
     return this.storage.readCanvas(path);
   }
 
+  async readCanvasRecord(path: string): ReturnType<StorageAdapter["readCanvasRecord"]> {
+    return this.storage.readCanvasRecord(path);
+  }
+
+  async clearCanvasConflict(path: string): Promise<void> {
+    await this.storage.clearCanvasConflict(path);
+  }
+
   async writeCanvas(path: string, content: string): Promise<void> {
     await this.storage.writeCanvas(path, content, {
       syncState: "dirty",
