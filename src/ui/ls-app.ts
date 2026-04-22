@@ -22,6 +22,9 @@ import "./ls-category-nav.ts";
 import type { LSCategoryNav } from "./ls-category-nav.ts";
 import "./ls-calendar.ts";
 import type { LSCalendar } from "./ls-calendar.ts";
+import "./ls-canvas.ts";
+import type { LSCanvas } from "./ls-canvas.ts";
+import { parseCanvas, serializeCanvas, emptyCanvas } from "../canvas/index.ts";
 import { canInstall, triggerInstall } from "../pwa.ts";
 import { getToast } from "./ls-toast.ts";
 import type { LSFileTree } from "./ls-file-tree.ts";
@@ -545,6 +548,58 @@ export class LSApp extends HTMLElement {
     this.#editorWrap.appendChild(welcome);
   }
 
+  async #openCanvas(path: string): Promise<void> {
+    let text = "";
+    try {
+      const existing = await vaultService.readCanvas(path);
+      text = existing ?? "";
+    } catch { text = ""; }
+    const doc = text ? parseCanvas(text) : emptyCanvas();
+
+    this.#editorWrap.innerHTML = "";
+    const canvas = document.createElement("ls-canvas") as LSCanvas;
+    canvas.style.cssText = "display:block;height:100%;width:100%;";
+    canvas.document = doc;
+    canvas.addEventListener("canvas-change", (e) => {
+      const nextDoc = (e as CustomEvent<{ document: unknown }>).detail.document as ReturnType<typeof parseCanvas>;
+      this.#saveCanvasDebounced(path, nextDoc);
+    });
+    this.#editorWrap.appendChild(canvas);
+    this.#editor = null;
+    requestAnimationFrame(() => canvas.focus());
+
+    // Canvas has no outline/backlinks today — clear the sidebar panels.
+    this.#outline.headings = [];
+    this.#backlinks.path = path;
+    this.#backlinks.links = vaultService.getBacklinks(path);
+
+    this.#lastLoadedContent = serializeCanvas(doc);
+  }
+
+  #saveCanvasDebounced(path: string, doc: ReturnType<typeof parseCanvas>): void {
+    if (this.#saveTimer) clearTimeout(this.#saveTimer);
+    this.#setStatus("syncing", "Saving…");
+    this.#saveTimer = setTimeout(async () => {
+      this.#saveTimer = null;
+      try {
+        const text = serializeCanvas(doc);
+        await vaultService.writeCanvas(path, text);
+        this.#lastLoadedContent = text;
+        this.#setStatus("ok", "Saved");
+      } catch (err) {
+        this.#setStatus("error", "Save failed");
+        console.error(err);
+      }
+    }, 400);
+  }
+
+  async #newCanvas(): Promise<void> {
+    const base = `Untitled-${Date.now()}`;
+    const path = `${base}.canvas`;
+    await vaultService.writeCanvas(path, serializeCanvas(emptyCanvas()));
+    navigateTo(path);
+  }
+
   #mountEditor(path: string, content: string): void {
     this.#editorWrap.innerHTML = "";
     const ed = document.createElement("ls-editor") as LSEditor;
@@ -692,8 +747,8 @@ export class LSApp extends HTMLElement {
   // ── Note list ─────────────────────────────────────────────────────────────
 
   async #loadNoteList(): Promise<void> {
-    const notes = await vaultService.listNotes();
-    const paths = notes.map((n) => n.path);
+    const entries = await vaultService.list();
+    const paths = entries.map((e) => e.path).sort();
     this.#fileTree.notes = paths;
     this.#fileTree.activePath = this.#activePath;
     this.#switcher.notes = paths;
@@ -738,6 +793,12 @@ export class LSApp extends HTMLElement {
     this.#fileTree.activePath = path;
     this.#calendar.activePath = path;
     this.#conflictBanner.classList.remove("visible");
+
+    // Route by file extension. .canvas → <ls-canvas>, everything else → editor.
+    if (path.endsWith(".canvas")) {
+      await this.#openCanvas(path);
+      return;
+    }
 
     let content = "";
     try {
@@ -857,10 +918,21 @@ export class LSApp extends HTMLElement {
       this.#setStatus("error", "No active note to move");
       return;
     }
-    const newPath = prompt("Move to (full path, including .md):", this.#activePath);
-    if (!newPath || newPath === this.#activePath) return;
-    const normalized = newPath.endsWith(".md") ? newPath : `${newPath}.md`;
-    this.#renameNote(this.#activePath, normalized);
+    const oldPath = this.#activePath;
+    const dot = oldPath.lastIndexOf(".");
+    const ext = dot >= 0 ? oldPath.slice(dot) : ".md";
+    const newPath = prompt(`Move to (full path, including ${ext}):`, oldPath);
+    if (!newPath || newPath === oldPath) return;
+    const normalized = newPath.endsWith(ext) ? newPath : `${newPath}${ext}`;
+    vaultService.rename(oldPath, normalized)
+      .then(async () => {
+        await this.#loadNoteList();
+        if (this.#activePath === oldPath) navigateTo(normalized);
+      })
+      .catch((err) => {
+        this.#setStatus("error", "Move failed");
+        console.error(err);
+      });
   }
 
   async #showStorageQuota(): Promise<void> {
@@ -898,7 +970,7 @@ export class LSApp extends HTMLElement {
     if (!confirm(`Delete "${this.#activePath}"? This cannot be undone.`)) return;
     const toDelete = this.#activePath;
     try {
-      await vaultService.deleteNote(toDelete);
+      await vaultService.delete(toDelete);
       await this.#loadNoteList();
       navigateHome();
     } catch (err) {
@@ -909,7 +981,7 @@ export class LSApp extends HTMLElement {
 
   #renameNote(oldPath: string, newPath: string): void {
     if (oldPath === newPath) return;
-    vaultService.renameNote(oldPath, newPath)
+    vaultService.rename(oldPath, newPath)
       .then(async () => {
         await this.#loadNoteList();
         if (this.#activePath === oldPath) {
@@ -962,6 +1034,7 @@ export class LSApp extends HTMLElement {
 
   #registerCommands(): void {
     this.#palette.register({ id: "new-note", label: "New note", description: "Create a new note", shortcut: "Ctrl+N" });
+    this.#palette.register({ id: "new-canvas", label: "New canvas", description: "Create a new JSON Canvas file" });
     this.#palette.register({ id: "quick-open", label: "Quick open note", description: "Jump to a note by name", shortcut: "Ctrl+P" });
     this.#palette.register({ id: "search", label: "Search notes", description: "Full-text search across vault", shortcut: "Ctrl+Shift+F" });
     this.#palette.register({ id: "daily-today", label: "Open today's daily note", description: "Create or open today's daily note", shortcut: "Ctrl+D" });
@@ -979,6 +1052,9 @@ export class LSApp extends HTMLElement {
     switch (id) {
       case "new-note":
         this.#newNote("").catch(console.error);
+        break;
+      case "new-canvas":
+        this.#newCanvas().catch(console.error);
         break;
       case "quick-open":
         this.#switcher.open();

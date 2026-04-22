@@ -206,6 +206,51 @@ export class VaultService extends EventTarget {
     return this.storage.listNotes();
   }
 
+  async listCanvases(): Promise<{ path: string }[]> {
+    const records = await this.storage.listCanvas();
+    return records.map((r) => ({ path: r.path }));
+  }
+
+  // ── Type-agnostic dispatchers ────────────────────────────────────────────
+  // Callers that don't need to know whether something is a note, a canvas,
+  // or a future resource type should prefer these. Adding a new kind of file
+  // means wiring it into the switch in one place, not across every UI call site.
+
+  static #kindFromPath(path: string): "note" | "canvas" | "unknown" {
+    if (path.endsWith(".canvas")) return "canvas";
+    if (path.endsWith(".md")) return "note";
+    return "unknown";
+  }
+
+  async list(): Promise<{ path: string; kind: "note" | "canvas" }[]> {
+    const [notes, canvases] = await Promise.all([this.listNotes(), this.listCanvases()]);
+    return [
+      ...notes.map((n) => ({ path: n.path, kind: "note" as const })),
+      ...canvases.map((c) => ({ path: c.path, kind: "canvas" as const })),
+    ];
+  }
+
+  async delete(path: string): Promise<void> {
+    switch (VaultService.#kindFromPath(path)) {
+      case "note": return this.deleteNote(path);
+      case "canvas": return this.deleteCanvas(path);
+      default: throw new Error(`Don't know how to delete: ${path}`);
+    }
+  }
+
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    const fromKind = VaultService.#kindFromPath(oldPath);
+    const toKind = VaultService.#kindFromPath(newPath);
+    if (fromKind !== toKind) {
+      throw new Error(`Cannot rename across file kinds: ${oldPath} → ${newPath}`);
+    }
+    switch (fromKind) {
+      case "note": return this.renameNote(oldPath, newPath);
+      case "canvas": return this.renameCanvas(oldPath, newPath);
+      default: throw new Error(`Don't know how to rename: ${oldPath}`);
+    }
+  }
+
   /**
    * Rename a note and rewrite all wikilinks pointing at it.
    * Produces a single dirty write per affected note.
@@ -260,6 +305,13 @@ export class VaultService extends EventTarget {
       Object.assign(new Event("note:deleted"), { detail: { path } })
     );
     this.enqueueSyncTick();
+  }
+
+  async renameCanvas(oldPath: string, newPath: string): Promise<void> {
+    const content = await this.storage.readCanvas(oldPath);
+    if (content === null) throw new Error(`Canvas not found: ${oldPath}`);
+    await this.writeCanvas(newPath, content);
+    await this.deleteCanvas(oldPath);
   }
 
   // ── Attachment API ──────────────────────────────────────────────────────────
