@@ -1074,6 +1074,44 @@ export class LSApp extends HTMLElement {
     return cleaned || null;
   }
 
+  /** Unique folder paths (no trailing slash, no empty root) derived from the
+   *  current note list. Used to feed folder-pick switcher flows. */
+  async #listFolders(): Promise<string[]> {
+    const entries = await vaultService.list();
+    const set = new Set<string>();
+    for (const e of entries) {
+      const slash = e.path.lastIndexOf("/");
+      if (slash < 0) continue;
+      // Also include every ancestor so "journal" shows up even if only
+      // "journal/private/foo.md" exists.
+      let p = e.path.slice(0, slash);
+      while (p) {
+        set.add(p);
+        const up = p.lastIndexOf("/");
+        p = up >= 0 ? p.slice(0, up) : "";
+      }
+    }
+    return [...set].sort();
+  }
+
+  async #pickFolder(placeholder: string, emptyHint = "No folders yet"): Promise<string | null> {
+    const folders = await this.#listFolders();
+    if (folders.length === 0) {
+      getToast().show(emptyHint, "info", 3000);
+      return null;
+    }
+    const items = folders.map((f) => {
+      const slash = f.lastIndexOf("/");
+      return {
+        value: f,
+        primary: slash >= 0 ? f.slice(slash + 1) : f,
+        secondary: slash >= 0 ? f.slice(0, slash) : "",
+        search: f,
+      };
+    });
+    return this.#switcher.pickItems(items, { placeholder, emptyHint });
+  }
+
   async #newFolder(parent = "", name?: string): Promise<void> {
     // When called from the file tree we already have the single-segment name;
     // from the palette we fall back to a free-form prompt so power users can
@@ -1103,9 +1141,9 @@ export class LSApp extends HTMLElement {
   }
 
   async #renameFolder(): Promise<void> {
-    const oldFolder = this.#normalizeFolder(prompt("Rename folder — current path:"));
+    const oldFolder = await this.#pickFolder("Rename folder — pick current:");
     if (!oldFolder) return;
-    const newFolder = this.#normalizeFolder(prompt("Rename folder — new path:", oldFolder));
+    const newFolder = this.#normalizeFolder(prompt(`Rename "${oldFolder}" to:`, oldFolder));
     if (!newFolder || newFolder === oldFolder) return;
     const oldPrefix = oldFolder + "/";
     const newPrefix = newFolder + "/";
@@ -1159,7 +1197,7 @@ export class LSApp extends HTMLElement {
   }
 
   async #deleteFolder(): Promise<void> {
-    const folder = this.#normalizeFolder(prompt("Delete folder — path:"));
+    const folder = await this.#pickFolder("Delete folder — pick one:");
     if (!folder) return;
     const prefix = folder + "/";
     const entries = (await vaultService.list()).filter((e) => e.path.startsWith(prefix));
@@ -2038,16 +2076,16 @@ export class LSApp extends HTMLElement {
         });
         break;
       case "encrypt-folder":
-        this.#promptEncryptFolder();
+        this.#promptEncryptFolder().catch(console.error);
         break;
       case "decrypt-folder":
         this.#promptDecryptFolder().catch(console.error);
         break;
       case "unlock-folder":
-        this.#promptUnlockFolder();
+        this.#promptUnlockFolder().catch(console.error);
         break;
       case "lock-folder":
-        this.#promptLockFolder();
+        this.#promptLockFolder().catch(console.error);
         break;
       case "lock-all":
         vaultService.lockAll();
@@ -2059,10 +2097,13 @@ export class LSApp extends HTMLElement {
     }
   }
 
-  #promptEncryptFolder(): void {
-    const raw = prompt("Folder to encrypt (e.g. journal/private/):");
-    if (!raw) return;
-    const prefix = raw.replace(/^\/+/, "").replace(/\/+$/, "") + "/";
+  async #promptEncryptFolder(): Promise<void> {
+    const folder = await this.#pickFolder(
+      "Encrypt folder — pick one:",
+      "No folders to encrypt yet",
+    );
+    if (!folder) return;
+    const prefix = folder + "/";
     const existing = vaultService.listZones();
     if (existing.some((z) => z.prefix === prefix)) {
       getToast().show(`A zone already exists at ${prefix}.`, "warning", 4000);
@@ -2078,15 +2119,18 @@ export class LSApp extends HTMLElement {
       getToast().show("No encrypted folders to decrypt.", "info", 3000);
       return;
     }
-    const list = zones.map((z, i) => `${i + 1}. ${z.prefix}`).join("\n");
-    const pick = prompt(`Pick a folder to decrypt (enter number):\n${list}`);
-    if (!pick) return;
-    const idx = Number(pick) - 1;
-    if (!Number.isInteger(idx) || idx < 0 || idx >= zones.length) {
-      getToast().show("Invalid selection.", "warning", 3000);
-      return;
-    }
-    const zone = zones[idx]!;
+    const items = zones.map((z) => ({
+      value: z.id,
+      primary: z.prefix,
+      secondary: `${z.algorithm}${vaultService.isZoneUnlocked(z.id) ? "" : " · locked"}`,
+    }));
+    const zoneId = await this.#switcher.pickItems(items, {
+      placeholder: "Pick a folder to decrypt…",
+      emptyHint: "No zones",
+    });
+    if (!zoneId) return;
+    const zone = zones.find((z) => z.id === zoneId);
+    if (!zone) return;
     if (!vaultService.isZoneUnlocked(zone.id)) {
       this.#unlockModal.setZone(zone.id, zone.prefix);
       this.#unlockModal.show();
@@ -2117,34 +2161,46 @@ export class LSApp extends HTMLElement {
     this.#unlockModal.show();
   }
 
-  #promptUnlockFolder(): void {
+  async #promptUnlockFolder(): Promise<void> {
     const locked = vaultService.listZones().filter((z) => !vaultService.isZoneUnlocked(z.id));
     if (locked.length === 0) {
       getToast().show("No locked folders.", "info", 3000);
       return;
     }
-    const list = locked.map((z, i) => `${i + 1}. ${z.prefix}`).join("\n");
-    const pick = prompt(`Pick a folder to unlock (enter number):\n${list}`);
-    if (!pick) return;
-    const idx = Number(pick) - 1;
-    if (!Number.isInteger(idx) || idx < 0 || idx >= locked.length) return;
-    const zone = locked[idx]!;
+    const items = locked.map((z) => ({
+      value: z.id,
+      primary: z.prefix,
+      secondary: z.algorithm,
+    }));
+    const zoneId = await this.#switcher.pickItems(items, {
+      placeholder: "Pick a folder to unlock…",
+      emptyHint: "No locked zones",
+    });
+    if (!zoneId) return;
+    const zone = locked.find((z) => z.id === zoneId);
+    if (!zone) return;
     this.#unlockModal.setZone(zone.id, zone.prefix);
     this.#unlockModal.show();
   }
 
-  #promptLockFolder(): void {
+  async #promptLockFolder(): Promise<void> {
     const unlocked = vaultService.listZones().filter((z) => vaultService.isZoneUnlocked(z.id));
     if (unlocked.length === 0) {
       getToast().show("No unlocked folders.", "info", 3000);
       return;
     }
-    const list = unlocked.map((z, i) => `${i + 1}. ${z.prefix}`).join("\n");
-    const pick = prompt(`Pick a folder to lock (enter number):\n${list}`);
-    if (!pick) return;
-    const idx = Number(pick) - 1;
-    if (!Number.isInteger(idx) || idx < 0 || idx >= unlocked.length) return;
-    const zone = unlocked[idx]!;
+    const items = unlocked.map((z) => ({
+      value: z.id,
+      primary: z.prefix,
+      secondary: z.algorithm,
+    }));
+    const zoneId = await this.#switcher.pickItems(items, {
+      placeholder: "Pick a folder to lock…",
+      emptyHint: "No unlocked zones",
+    });
+    if (!zoneId) return;
+    const zone = unlocked.find((z) => z.id === zoneId);
+    if (!zone) return;
     vaultService.lockZone(zone.id);
     getToast().show(`"${zone.prefix}" locked.`, "info", 3000);
   }

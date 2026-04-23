@@ -1,10 +1,12 @@
-// <ls-switcher> — quick note switcher (Ctrl/Cmd+P).
+// <ls-switcher> — quick-pick overlay. Primary use is note-switching
+// (Ctrl/Cmd+P), but also functions as a generic fuzzy picker for any list
+// of items via pickItems(...).
 //
 // Properties:
-//   notes — string[] of vault paths to search
+//   notes — string[] of vault paths to search (used by open() and pick())
 //
 // Events (bubbles, composed):
-//   file-open — detail: { path: string }
+//   file-open — detail: { path: string }   only fired from Ctrl+P mode
 
 const style = `
   :host { display: none; }
@@ -65,16 +67,31 @@ const style = `
   }
 `;
 
+export interface PickerItem {
+  /** Value handed back via the pick promise when this item is selected. */
+  value: string;
+  /** Main text shown on the left. */
+  primary: string;
+  /** Optional muted text shown on the right. */
+  secondary?: string;
+  /** Fuzzy-match text. Falls back to `${primary} ${secondary ?? ""}` if omitted. */
+  search?: string;
+}
+
 export class LSSwitcher extends HTMLElement {
   #notes: string[] = [];
-  #filtered: string[] = [];
+  /** Source items the picker is searching through — populated from #notes in
+   *  file mode, or from the caller's items in pickItems mode. */
+  #items: PickerItem[] = [];
+  #filtered: PickerItem[] = [];
   #selectedIndex = 0;
   #shadow: ShadowRoot;
   #input!: HTMLInputElement;
   #list!: HTMLElement;
   /** When set, selections resolve this promise instead of firing file-open. */
-  #pickResolver: ((path: string | null) => void) | null = null;
+  #pickResolver: ((value: string | null) => void) | null = null;
   #defaultPlaceholder = "Jump to note…";
+  #emptyHint = "No notes found";
 
   constructor() {
     super();
@@ -97,6 +114,8 @@ export class LSSwitcher extends HTMLElement {
   set notes(v: string[]) { this.#notes = v; }
 
   open(): void {
+    this.#items = this.#notesToItems(this.#notes);
+    this.#emptyHint = "No notes found";
     this.#input.placeholder = this.#defaultPlaceholder;
     this.#input.value = "";
     this.#filter("");
@@ -105,24 +124,28 @@ export class LSSwitcher extends HTMLElement {
   }
 
   /**
-   * Open the switcher in "pick" mode. Instead of dispatching file-open on
-   * selection, returns a Promise that resolves with the picked path (or null
-   * if the user closed without choosing).
+   * Open the switcher in "pick" mode for the current notes list. Instead of
+   * dispatching file-open on selection, returns a Promise that resolves with
+   * the picked path (or null if the user closed without choosing).
    */
   pick(options: { placeholder?: string } = {}): Promise<string | null> {
-    // If there's already a pending pick, cancel it.
-    if (this.#pickResolver) {
-      this.#pickResolver(null);
-      this.#pickResolver = null;
-    }
-    return new Promise<string | null>((resolve) => {
-      this.#pickResolver = resolve;
-      this.#input.placeholder = options.placeholder ?? "Pick a note…";
-      this.#input.value = "";
-      this.#filter("");
-      this.classList.add("open");
-      requestAnimationFrame(() => this.#input.focus());
-    });
+    this.#items = this.#notesToItems(this.#notes);
+    this.#emptyHint = "No notes found";
+    return this.#openPromise(options.placeholder ?? "Pick a note…");
+  }
+
+  /**
+   * Generic item picker. Caller supplies the list; the switcher handles
+   * fuzzy search, keyboard nav, and selection. Resolves with the chosen
+   * item's `value`, or null if the user dismissed.
+   */
+  pickItems(
+    items: readonly PickerItem[],
+    options: { placeholder?: string; emptyHint?: string } = {},
+  ): Promise<string | null> {
+    this.#items = [...items];
+    this.#emptyHint = options.emptyHint ?? "No matches";
+    return this.#openPromise(options.placeholder ?? "Pick…");
   }
 
   close(): void {
@@ -131,6 +154,29 @@ export class LSSwitcher extends HTMLElement {
       this.#pickResolver(null);
       this.#pickResolver = null;
     }
+  }
+
+  #notesToItems(notes: readonly string[]): PickerItem[] {
+    return notes.map((path) => {
+      const base = path.split("/").pop() ?? path;
+      const folder = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+      return { value: path, primary: base, secondary: folder, search: path };
+    });
+  }
+
+  #openPromise(placeholder: string): Promise<string | null> {
+    if (this.#pickResolver) {
+      this.#pickResolver(null);
+      this.#pickResolver = null;
+    }
+    return new Promise<string | null>((resolve) => {
+      this.#pickResolver = resolve;
+      this.#input.placeholder = placeholder;
+      this.#input.value = "";
+      this.#filter("");
+      this.classList.add("open");
+      requestAnimationFrame(() => this.#input.focus());
+    });
   }
 
   // ── Private ───────────────────────────────────────────────────────────────
@@ -168,17 +214,17 @@ export class LSSwitcher extends HTMLElement {
 
   #filter(query: string): void {
     const q = query.toLowerCase().trim();
+    const searchText = (item: PickerItem): string =>
+      (item.search ?? `${item.primary} ${item.secondary ?? ""}`).toLowerCase();
     if (!q) {
-      this.#filtered = [...this.#notes].slice(0, 50);
+      this.#filtered = [...this.#items].slice(0, 50);
     } else {
-      this.#filtered = this.#notes
-        .filter((p) => p.toLowerCase().includes(q))
+      this.#filtered = this.#items
+        .filter((it) => searchText(it).includes(q))
         .sort((a, b) => {
-          const aBase = (a.split("/").pop() ?? a).toLowerCase();
-          const bBase = (b.split("/").pop() ?? b).toLowerCase();
-          const aStarts = aBase.startsWith(q) ? -1 : 0;
-          const bStarts = bBase.startsWith(q) ? -1 : 0;
-          return aStarts - bStarts || aBase.localeCompare(bBase);
+          const aStarts = a.primary.toLowerCase().startsWith(q) ? -1 : 0;
+          const bStarts = b.primary.toLowerCase().startsWith(q) ? -1 : 0;
+          return aStarts - bStarts || a.primary.localeCompare(b.primary);
         })
         .slice(0, 50);
     }
@@ -191,27 +237,24 @@ export class LSSwitcher extends HTMLElement {
     if (this.#filtered.length === 0) {
       const hint = document.createElement("div");
       hint.className = "empty-hint";
-      hint.textContent = "No notes found";
+      hint.textContent = this.#emptyHint;
       this.#list.appendChild(hint);
       return;
     }
-    this.#filtered.forEach((path, i) => {
+    this.#filtered.forEach((it, i) => {
       const item = document.createElement("div");
       item.className = "note-item" + (i === this.#selectedIndex ? " selected" : "");
 
-      const base = path.split("/").pop() ?? path;
       const name = document.createElement("span");
       name.className = "note-name";
-      name.textContent = base;
-
+      name.textContent = it.primary;
       item.appendChild(name);
 
-      if (path.includes("/")) {
-        const folder = path.slice(0, path.lastIndexOf("/"));
-        const pathSpan = document.createElement("span");
-        pathSpan.className = "note-path";
-        pathSpan.textContent = folder;
-        item.appendChild(pathSpan);
+      if (it.secondary) {
+        const secondary = document.createElement("span");
+        secondary.className = "note-path";
+        secondary.textContent = it.secondary;
+        item.appendChild(secondary);
       }
 
       item.addEventListener("click", () => this.#select(i));
@@ -220,20 +263,20 @@ export class LSSwitcher extends HTMLElement {
   }
 
   #select(index: number): void {
-    const path = this.#filtered[index];
-    if (!path) return;
+    const it = this.#filtered[index];
+    if (!it) return;
     const resolver = this.#pickResolver;
     this.#pickResolver = null;
     this.classList.remove("open");
     if (resolver) {
-      resolver(path);
+      resolver(it.value);
       return;
     }
     this.dispatchEvent(
       new CustomEvent("file-open", {
         bubbles: true,
         composed: true,
-        detail: { path },
+        detail: { path: it.value },
       })
     );
   }
