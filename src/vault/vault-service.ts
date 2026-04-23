@@ -1,5 +1,18 @@
 import { StorageAdapter } from "../storage/storage-adapter.ts";
-import { identityCodec } from "../codec/index.ts";
+import {
+  KEYS_JSON_PATH,
+  parseKeysJson,
+  serializeKeysJson,
+  createZone,
+  isKeysFile,
+  type KeysFile,
+  type Zone,
+  ZoneService,
+  layersForPath,
+  isPathEncrypted as pathHasZone,
+  validateNewZone,
+  renameZonePrefix as renameZonesPrefix,
+} from "../codec/index.ts";
 import type { NoteRecord } from "../storage/schema.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
 import { extractAllTags } from "./tags.ts";
@@ -23,8 +36,15 @@ export interface TagInfo {
 }
 
 export class VaultService extends EventTarget {
-  private readonly storage = new StorageAdapter(identityCodec);
+  private readonly zoneService: ZoneService;
+  private readonly storage: StorageAdapter;
   private readonly syncClient = new SyncClient();
+
+  constructor() {
+    super();
+    this.zoneService = new ZoneService();
+    this.storage = new StorageAdapter(this.zoneService);
+  }
 
   // ── In-memory indexes (rebuilt on load, updated incrementally) ─────────────
 
@@ -40,7 +60,7 @@ export class VaultService extends EventTarget {
   private noteUpdatedAt = new Map<string, number>();
 
   private readonly resolver = new WikilinkResolver();
-  private readonly search = new VaultSearch();
+  private search = new VaultSearch();
 
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
   private initialized = false;
@@ -51,6 +71,14 @@ export class VaultService extends EventTarget {
     if (this.initialized) return;
     this.initialized = true;
 
+    // Load zone metadata (if any) so the storage adapter can dispatch reads
+    // against the correct codec layers. Identities remain locked — they get
+    // unwrapped lazily the first time a file in that zone is touched.
+    try {
+      await this.loadZones();
+    } catch (err) {
+      console.warn("[vault] loadZones failed (will proceed with no zones):", err);
+    }
     await this.rebuildIndexes();
     this.wireSyncEvents();
     this.wireNetworkEvents();
@@ -58,7 +86,14 @@ export class VaultService extends EventTarget {
     this.dispatchEvent(new Event("vault:ready"));
   }
 
-  private async rebuildIndexes(): Promise<void> {
+  async rebuildIndexes(): Promise<void> {
+    // Clear before rebuilding — supports being called mid-lifecycle after a
+    // codec swap (unlock/enable-encryption/lock), not just at first init.
+    this.incoming.clear();
+    this.outgoing.clear();
+    this.tagIndex.clear();
+    this.noteUpdatedAt.clear();
+
     // Try restoring the search snapshot first (startup-latency optimization).
     const snapshot = await this.storage.readIndexesSnapshot();
 
@@ -71,17 +106,29 @@ export class VaultService extends EventTarget {
         // Only use snapshot if note count matches — otherwise full rebuild.
         if (restoredSearch.documentCount === notes.length) {
           Object.assign(this, { search: restoredSearch });
+        } else {
+          this.search = new VaultSearch();
         }
       } catch {
-        // Corrupt snapshot — rebuild from scratch below.
+        this.search = new VaultSearch();
       }
+    } else {
+      this.search = new VaultSearch();
     }
 
     for (const record of notes) {
-      const content = await this.storage.readNote(record.path);
-      if (content !== null) {
-        this.indexNote(record.path, content, record.frontmatter);
-        this.noteUpdatedAt.set(record.path, record.updatedAt);
+      try {
+        const content = await this.storage.readNote(record.path);
+        if (content !== null) {
+          this.indexNote(record.path, content, record.frontmatter);
+          this.noteUpdatedAt.set(record.path, record.updatedAt);
+        }
+      } catch (err) {
+        // Notes in a locked zone can't be indexed until the zone is unlocked;
+        // that's expected and not worth logging.
+        if ((err as Error)?.name !== "ZoneLockedError") {
+          console.warn("[vault] rebuildIndexes: failed to decode", record.path, err);
+        }
       }
     }
   }
@@ -145,6 +192,15 @@ export class VaultService extends EventTarget {
   }
 
   private async onSyncCompleted(headOid?: string): Promise<void> {
+    // Re-pull zones from keys.json: a remote commit may have created or
+    // removed a zone, or this may be the first sync after sign-in on a
+    // fresh device (in which case keys.json only just landed in OPFS).
+    // ReadNote inside the index rebuild needs the zone list to be correct;
+    // badges in the UI need it too.
+    await this.loadZones().catch((err) =>
+      console.warn("[vault] loadZones after sync failed:", err),
+    );
+
     // Re-read any notes whose updatedAt changed since we last indexed them.
     const records = await this.storage.listNotes();
     for (const record of records) {
@@ -351,6 +407,185 @@ export class VaultService extends EventTarget {
 
   async forcePush(): Promise<void> {
     await this.syncClient.call("forcePush");
+  }
+
+  // ── Repo-level aux files (keys.json, etc.) ──────────────────────────────
+
+  async readRepoFile(path: string): Promise<Uint8Array | null> {
+    const res = await this.syncClient.call("readRepoFile", { path });
+    return (res.result as { bytes: Uint8Array | null }).bytes;
+  }
+
+  async writeRepoFile(path: string, bytes: Uint8Array): Promise<void> {
+    await this.syncClient.call("writeRepoFile", { path, bytes });
+  }
+
+  // ── Encryption zones ─────────────────────────────────────────────────────
+
+  /** Load the zone list from `.lemonstone/keys.json` (if present) into the
+   *  zone service. Identities stay locked; the user unlocks each as needed.
+   *  Fires `vault:zonesReloaded` so UI layers (badges, zone lists) refresh. */
+  async loadZones(): Promise<void> {
+    const bytes = await this.readRepoFile(KEYS_JSON_PATH);
+    if (!bytes) {
+      this.zoneService.setZones([]);
+    } else {
+      try {
+        const file = parseKeysJson(bytes);
+        this.zoneService.setZones(file.zones);
+      } catch (err) {
+        console.warn("[vault] keys.json failed to parse; treating vault as plaintext:", err);
+        this.zoneService.setZones([]);
+      }
+    }
+    this.dispatchEvent(new Event("vault:zonesReloaded"));
+  }
+
+  listZones(): Zone[] {
+    return this.zoneService.listZones();
+  }
+
+  applicableZones(path: string): Zone[] {
+    return this.zoneService.applicableZones(path);
+  }
+
+  isPathEncrypted(path: string): boolean {
+    return pathHasZone(path, this.zoneService.listZones());
+  }
+
+  isZoneUnlocked(zoneId: string): boolean {
+    return this.zoneService.isUnlocked(zoneId);
+  }
+
+  /** Unlock a zone by its id. Throws on wrong passphrase.
+   *  On success, re-indexes every note under that zone's prefix so newly
+   *  readable content shows up in search / backlinks / tags. */
+  async unlockZone(zoneId: string, passphrase: string): Promise<void> {
+    await this.zoneService.unlockZone(zoneId, passphrase);
+    const zone = this.zoneService.getZone(zoneId);
+    if (zone) {
+      const notes = await this.storage.listNotes();
+      for (const record of notes) {
+        if (!record.path.startsWith(zone.prefix)) continue;
+        try {
+          const content = await this.storage.readNote(record.path);
+          if (content !== null) {
+            this.indexNote(record.path, content, record.frontmatter);
+            this.noteUpdatedAt.set(record.path, record.updatedAt);
+          }
+        } catch (err) {
+          // Still-locked deeper zone, or transient decode failure.
+          if ((err as Error)?.name !== "ZoneLockedError") {
+            console.warn("[vault] unlockZone: decode failed for", record.path, err);
+          }
+        }
+      }
+    }
+    this.dispatchEvent(Object.assign(new Event("vault:zoneUnlocked"), { detail: { zoneId } }));
+  }
+
+  lockZone(zoneId: string): void {
+    this.zoneService.lockZone(zoneId);
+    this.dispatchEvent(Object.assign(new Event("vault:zoneLocked"), { detail: { zoneId } }));
+  }
+
+  /** Clear all in-memory identities (e.g. on sign-out). */
+  lockAll(): void {
+    this.zoneService.lockAll();
+    this.dispatchEvent(new Event("vault:allZonesLocked"));
+  }
+
+  /** Create a new encrypted zone anchored at `prefix` with the given passphrase.
+   *  Existing records under the prefix are wrapped with the new outer layer.
+   *  Because wrapping doesn't require decrypting existing layers, creating a
+   *  zone that is nested inside another zone (or contains other zones) works
+   *  without needing those other zones to be unlocked. */
+  async createZone(args: {
+    prefix: string;
+    passphrase: string;
+    algorithm?: "age-v1";
+  }): Promise<Zone> {
+    const zones = this.zoneService.listZones();
+    // Normalizes internally; throws on duplicate.
+    const { zone, identity } = await createZone(
+      args.prefix,
+      args.passphrase,
+      args.algorithm ?? "age-v1",
+    );
+    validateNewZone(zone.prefix, zones);
+
+    const nextZones = [...zones, zone];
+    this.zoneService.setZones(nextZones);
+    this.zoneService.registerIdentity(zone.id, identity);
+
+    // Wrap every existing record under this prefix with the new outer layer.
+    await this.storage.reencodeUnderPrefix(zone.prefix, (currentLayers) => [
+      zone.id,
+      ...currentLayers,
+    ]);
+
+    await this.persistKeysFile({ version: 1, zones: nextZones });
+    await this.rebuildIndexes();
+    this.enqueueSyncTick();
+    this.dispatchEvent(Object.assign(new Event("vault:zoneCreated"), { detail: { zoneId: zone.id } }));
+    return zone;
+  }
+
+  /** Remove a zone: peel its layer off every record under its prefix, then
+   *  drop it from keys.json. The zone must be unlocked. */
+  async removeZone(zoneId: string): Promise<void> {
+    const zone = this.zoneService.getZone(zoneId);
+    if (!zone) throw new Error(`no such zone: ${zoneId}`);
+    if (!this.zoneService.isUnlocked(zoneId)) {
+      throw new Error(`zone ${zone.prefix} must be unlocked before removal`);
+    }
+
+    await this.storage.reencodeUnderPrefix(zone.prefix, (currentLayers) =>
+      currentLayers.filter((id) => id !== zoneId),
+    );
+
+    const nextZones = this.zoneService.listZones().filter((z) => z.id !== zoneId);
+    this.zoneService.setZones(nextZones);
+    await this.persistKeysFile({ version: 1, zones: nextZones });
+    await this.rebuildIndexes();
+    this.enqueueSyncTick();
+    this.dispatchEvent(Object.assign(new Event("vault:zoneRemoved"), { detail: { zoneId } }));
+  }
+
+  /** Rename a zone's prefix. Metadata-only — records reference zones by id. */
+  async renameZonePrefix(oldPrefix: string, newPrefix: string): Promise<void> {
+    const nextZones = renameZonesPrefix(this.zoneService.listZones(), oldPrefix, newPrefix);
+    this.zoneService.setZones(nextZones);
+    await this.persistKeysFile({ version: 1, zones: nextZones });
+    this.enqueueSyncTick();
+  }
+
+  /** For the UI: does renaming `oldPath` to `newPath` cross an encryption boundary? */
+  planRename(oldPath: string, newPath: string): {
+    crosses: boolean;
+    oldLayers: string[];
+    newLayers: string[];
+    zonesToUnlock: string[];
+  } {
+    const zones = this.zoneService.listZones();
+    const oldLayers = layersForPath(oldPath, zones);
+    const newLayers = layersForPath(newPath, zones);
+    const crosses =
+      oldLayers.length !== newLayers.length ||
+      oldLayers.some((id, i) => id !== newLayers[i]);
+    // To re-encode we need every zone whose layer we're stripping off the old
+    // path; adding layers doesn't require any unlock.
+    const stripping = oldLayers.filter((id) => !newLayers.includes(id));
+    const zonesToUnlock = stripping.filter((id) => !this.zoneService.isUnlocked(id));
+    return { crosses, oldLayers, newLayers, zonesToUnlock };
+  }
+
+  /** Internal: write keys.json + stage it via the sync worker. */
+  private async persistKeysFile(file: KeysFile): Promise<void> {
+    if (!isKeysFile(file)) {
+      throw new Error("persistKeysFile: refusing to write malformed keys.json");
+    }
+    await this.writeRepoFile(KEYS_JSON_PATH, serializeKeysJson(file));
   }
 
   async recentCommits(limit = 30): Promise<Array<{ oid: string; message: string; author: string; date: number }>> {

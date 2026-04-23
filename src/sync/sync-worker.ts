@@ -97,6 +97,21 @@ self.addEventListener("message", async (e: MessageEvent<WorkerRequest>) => {
         break;
       }
 
+      case "readRepoFile": {
+        const path = args["path"] as string;
+        const bytes = await engine.readRepoFile(path);
+        self.postMessage(ok(id, { bytes }));
+        break;
+      }
+
+      case "writeRepoFile": {
+        const path = args["path"] as string;
+        const bytes = args["bytes"] as Uint8Array;
+        await engine.writeRepoFile(path, bytes);
+        self.postMessage(ok(id));
+        break;
+      }
+
       default: {
         self.postMessage(
           err(id, "UNKNOWN_OP", `Unknown op: ${op as string}`, false)

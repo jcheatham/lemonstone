@@ -9,7 +9,9 @@ export type SyncOp =
   | "forcePush"
   | "recentCommits"
   | "commitDetails"
-  | "restoreToCommit";
+  | "restoreToCommit"
+  | "readRepoFile"
+  | "writeRepoFile";
 
 export interface WorkerRequest {
   id: string;

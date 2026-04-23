@@ -30,6 +30,7 @@
     "@codemirror/state": "^6.6.0",
     "@codemirror/view": "^6.41.1",
     "@isomorphic-git/lightning-fs": "^4.6.2",
+    "age-encryption": "^0.3.0",
     "codemirror": "^6.0.2",
     "idb": "^8.0.3",
     "isomorphic-git": "^1.37.5",

@@ -1,0 +1,23 @@
+{
+  "name": "lemonstone-decrypt",
+  "version": "0.1.0",
+  "description": "Decrypt a Lemonstone vault from a plain git checkout. The browser PWA is not required — given the passphrase, this tool recovers every note, canvas, and attachment.",
+  "type": "module",
+  "bin": {
+    "lemonstone-decrypt": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "age-encryption": "^0.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "typescript": "~5.6.2"
+  }
+}

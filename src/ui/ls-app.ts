@@ -26,6 +26,10 @@ import "./ls-canvas.ts";
 import type { LSCanvas } from "./ls-canvas.ts";
 import "./ls-history.ts";
 import type { LSHistory, CommitSummary } from "./ls-history.ts";
+import "./ls-unlock-modal.ts";
+import type { LSUnlockModal } from "./ls-unlock-modal.ts";
+import "./ls-enable-encryption-modal.ts";
+import type { LSEncryptFolderModal } from "./ls-enable-encryption-modal.ts";
 import { parseCanvas, serializeCanvas, emptyCanvas, mergeCanvases } from "../canvas/index.ts";
 import { canInstall, triggerInstall } from "../pwa.ts";
 import { getToast } from "./ls-toast.ts";
@@ -366,6 +370,8 @@ export class LSApp extends HTMLElement {
   #history!: LSHistory;
   #activeCommitOid = "";
   #commandsPanel!: HTMLElement;
+  #unlockModal!: LSUnlockModal;
+  #encryptFolderModal!: LSEncryptFolderModal;
   readonly #dailyFolder = "daily";
   #previewedCategory = "files";
   #activeCategory: string | null = null;
@@ -452,12 +458,26 @@ export class LSApp extends HTMLElement {
       this.#drillInto("files");
     });
     this.#fileTree.addEventListener("file-new", (e) => {
-      const { folder } = (e as CustomEvent<{ folder: string }>).detail;
-      this.#newNote(folder);
+      const { folder, kind, name } = (e as CustomEvent<{ folder: string; kind: "note" | "canvas" | "folder"; name: string }>).detail;
+      switch (kind) {
+        case "note":
+          this.#newNote(folder, name).catch(console.error);
+          break;
+        case "canvas":
+          this.#newCanvas(folder, name).catch(console.error);
+          break;
+        case "folder":
+          this.#newFolder(folder, name).catch(console.error);
+          break;
+      }
     });
     this.#fileTree.addEventListener("file-rename", (e) => {
       const { oldPath, newPath } = (e as CustomEvent<{ oldPath: string; newPath: string }>).detail;
       this.#renameNote(oldPath, newPath);
+    });
+    this.#fileTree.addEventListener("zone-toggle", (e) => {
+      const { prefix, unlocked } = (e as CustomEvent<{ prefix: string; unlocked: boolean }>).detail;
+      this.#toggleZone(prefix, unlocked);
     });
     filesTop.appendChild(this.#fileTree);
     filesPanel.appendChild(filesTop);
@@ -607,6 +627,28 @@ export class LSApp extends HTMLElement {
     });
     this.#authOverlay.appendChild(modal);
 
+    // Vault encryption modals
+    this.#unlockModal = document.createElement("ls-unlock-modal") as LSUnlockModal;
+    this.#unlockModal.addEventListener("vault-unlock", (e) => {
+      const { passphrase, zoneId } = (e as CustomEvent<{ passphrase: string; zoneId: string }>).detail;
+      this.#handleUnlock(zoneId, passphrase).catch(console.error);
+    });
+    this.#unlockModal.addEventListener("vault-unlock-cancel", () => {
+      // User dismissed without unlocking. If they were parked on a locked
+      // file, kick them to home so they're not staring at a placeholder
+      // with no action they can take.
+      if (this.#activePath) {
+        const zones = vaultService.applicableZones(this.#activePath);
+        const stillLocked = zones.some((z) => !vaultService.isZoneUnlocked(z.id));
+        if (stillLocked) navigateHome();
+      }
+    });
+    this.#encryptFolderModal = document.createElement("ls-encrypt-folder-modal") as LSEncryptFolderModal;
+    this.#encryptFolderModal.addEventListener("zone-create", (e) => {
+      const { prefix, passphrase } = (e as CustomEvent<{ prefix: string; passphrase: string }>).detail;
+      this.#handleCreateZone(prefix, passphrase).catch(console.error);
+    });
+
     // Palette + switcher (appended to shadow root, not inside a flex child)
     this.#palette = document.createElement("ls-command-palette") as LSCommandPalette;
     this.#palette.addEventListener("palette-command", (e) => {
@@ -631,6 +673,8 @@ export class LSApp extends HTMLElement {
       layout,
       this.#statusBar,
       this.#authOverlay,
+      this.#unlockModal,
+      this.#encryptFolderModal,
       this.#palette,
       this.#switcher
     );
@@ -762,8 +806,23 @@ export class LSApp extends HTMLElement {
   }
 
   async #openCanvas(path: string): Promise<void> {
+    if (this.#promptUnlockIfLocked(path)) {
+      this.#mountLockedPlaceholder(path);
+      return;
+    }
+
     const record = await vaultService.readCanvasRecord(path);
-    const text = record?.content ? new TextDecoder().decode(record.content) : "";
+    let text = "";
+    try {
+      text = (await vaultService.readCanvas(path)) ?? "";
+    } catch (err) {
+      if ((err as Error)?.name === "ZoneLockedError") {
+        this.#promptUnlockIfLocked(path);
+        this.#mountLockedPlaceholder(path);
+        return;
+      }
+      text = "";
+    }
     const doc = text ? parseCanvas(text) : emptyCanvas();
     const inConflict = record?.syncState === "conflict" && !!record.conflict;
 
@@ -968,9 +1027,15 @@ export class LSApp extends HTMLElement {
     }
   }
 
-  async #newCanvas(): Promise<void> {
-    const base = `Untitled-${Date.now()}`;
-    const path = `${base}.canvas`;
+  async #newCanvas(folder = "", name?: string): Promise<void> {
+    const base = name?.trim() || `Untitled-${Date.now()}`;
+    const filename = base.endsWith(".canvas") ? base : `${base}.canvas`;
+    const path = folder ? `${folder}/${filename}` : filename;
+    if ((await vaultService.readCanvas(path)) !== null) {
+      getToast().show(`${path} already exists`, "info", 4000);
+      navigateTo(path);
+      return;
+    }
     await vaultService.writeCanvas(path, serializeCanvas(emptyCanvas()));
     navigateTo(path);
   }
@@ -986,9 +1051,21 @@ export class LSApp extends HTMLElement {
     return cleaned || null;
   }
 
-  async #newFolder(): Promise<void> {
-    const folder = this.#normalizeFolder(prompt("New folder path (e.g. projects/work):"));
-    if (!folder) return;
+  async #newFolder(parent = "", name?: string): Promise<void> {
+    // When called from the file tree we already have the single-segment name;
+    // from the palette we fall back to a free-form prompt so power users can
+    // still type a multi-segment path ("projects/work") in one shot.
+    let cleaned: string | null;
+    if (name !== undefined) {
+      cleaned = this.#normalizeFolder(name);
+    } else {
+      const promptText = parent
+        ? `New folder name (inside ${parent}):`
+        : "New folder path (e.g. projects/work):";
+      cleaned = this.#normalizeFolder(prompt(promptText));
+    }
+    if (!cleaned) return;
+    const folder = parent ? `${parent}/${cleaned}` : cleaned;
     const path = `${folder}/README.md`;
     const existing = await vaultService.readNote(path);
     if (existing !== null) {
@@ -1166,11 +1243,57 @@ export class LSApp extends HTMLElement {
     } catch (err) {
       console.warn("Clone skipped or failed:", err);
     }
+
+    // Zones (if any) are loaded lazily — identities stay locked until the
+    // user opens a file in one, at which point we intercept the
+    // ZoneLockedError and show the unlock modal. No eager prompt here.
+    await this.#continuePostAuthInit();
+  }
+
+  async #continuePostAuthInit(): Promise<void> {
     // Sync ensures IndexedDB is populated even if clone was a no-op.
     vaultService.sync().catch(console.error);
     this.#setStatus("ok", "Ready");
     await this.#loadNoteList();
     await this.#handleRoute(currentRoute());
+  }
+
+  async #handleUnlock(zoneId: string, passphrase: string): Promise<void> {
+    this.#unlockModal.setBusy(true);
+    try {
+      await vaultService.unlockZone(zoneId, passphrase);
+      this.#unlockModal.hide();
+      await this.#loadNoteList();
+      // Re-open the active path. If it's a nested-zone file and a deeper
+      // zone is still locked, this will prompt for the next one; otherwise
+      // the editor mounts with real content.
+      if (this.#activePath) {
+        this.#openNote(this.#activePath).catch(console.error);
+      }
+    } catch (err) {
+      console.warn("unlock failed:", err);
+      this.#unlockModal.setError("Wrong passphrase — try again.");
+    } finally {
+      this.#unlockModal.setBusy(false);
+    }
+  }
+
+  async #handleCreateZone(prefix: string, passphrase: string): Promise<void> {
+    this.#encryptFolderModal.setBusy("Encrypting folder…");
+    try {
+      const zone = await vaultService.createZone({ prefix, passphrase });
+      this.#encryptFolderModal.hide();
+      this.#setStatus("ok", "Folder encrypted");
+      getToast().show(
+        `"${zone.prefix}" is now an encrypted zone. The next sync will push the encrypted files.`,
+        "success",
+        6000
+      );
+      await this.#loadNoteList();
+    } catch (err) {
+      console.error(err);
+      this.#encryptFolderModal.setError((err as Error).message || "Failed to encrypt folder.");
+    }
   }
 
   // ── Vault event wiring ────────────────────────────────────────────────────
@@ -1188,6 +1311,17 @@ export class LSApp extends HTMLElement {
     vaultService.addEventListener("note:deleted", () => {
       this.#loadNoteList().catch(console.error);
     });
+
+    for (const ev of ["vault:zoneCreated", "vault:zoneRemoved", "vault:zoneUnlocked", "vault:zoneLocked", "vault:allZonesLocked", "vault:zonesReloaded"]) {
+      vaultService.addEventListener(ev, () => this.#refreshZoneBadges());
+    }
+    // When a zone locks, an actively-open file inside that zone should be
+    // evicted: the editor is still showing plaintext in memory, and edits
+    // would silently fail on save (the codec can't encode without the
+    // identity). Re-opening routes through the locked-placeholder path.
+    for (const ev of ["vault:zoneLocked", "vault:allZonesLocked"]) {
+      vaultService.addEventListener(ev, () => this.#evictIfActiveLocked());
+    }
 
     vaultService.addEventListener("vault:synced", (e) => {
       this.#setStatus("ok", "Synced");
@@ -1243,11 +1377,19 @@ export class LSApp extends HTMLElement {
 
   // ── Note list ─────────────────────────────────────────────────────────────
 
+  #refreshZoneBadges(): void {
+    this.#fileTree.zones = vaultService.listZones().map((z) => ({
+      prefix: z.prefix,
+      unlocked: vaultService.isZoneUnlocked(z.id),
+    }));
+  }
+
   async #loadNoteList(): Promise<void> {
     const entries = await vaultService.list();
     const paths = entries.map((e) => e.path).sort();
     this.#fileTree.notes = paths;
     this.#fileTree.activePath = this.#activePath;
+    this.#refreshZoneBadges();
     this.#switcher.notes = paths;
     this.#calendar.notes = paths;
     this.#calendar.activePath = this.#activePath;
@@ -1307,11 +1449,26 @@ export class LSApp extends HTMLElement {
       return;
     }
 
+    // If any zone on this path is locked, stop here and ask for its
+    // passphrase. After a successful unlock, #handleUnlock re-runs this method
+    // — nested zones get prompted one at a time.
+    if (this.#promptUnlockIfLocked(path)) {
+      this.#mountLockedPlaceholder(path);
+      return;
+    }
+
     let content = "";
     try {
       const note = await vaultService.readNote(path);
       content = note ?? "";
-    } catch {
+    } catch (err) {
+      if ((err as Error)?.name === "ZoneLockedError") {
+        // Race with a lock state change between check and read — treat
+        // the same as the proactive branch above.
+        this.#promptUnlockIfLocked(path);
+        this.#mountLockedPlaceholder(path);
+        return;
+      }
       content = "";
     }
 
@@ -1325,6 +1482,62 @@ export class LSApp extends HTMLElement {
 
     this.#mountEditor(path, content);
     this.#updateSidebarPanels(path, content);
+  }
+
+  /** Called when any zone just locked. If the active file is inside a locked
+   *  zone, cancel any pending save and evict the editor to the home screen.
+   *  We don't auto-prompt for unlock here — the user just asked to lock, so
+   *  forcing a modal back at them would be hostile. They can re-open the file
+   *  (which prompts) or click the lock badge when they want in again. */
+  #evictIfActiveLocked(): void {
+    if (!this.#activePath) return;
+    const zones = vaultService.applicableZones(this.#activePath);
+    const stillLocked = zones.some((z) => !vaultService.isZoneUnlocked(z.id));
+    if (!stillLocked) return;
+    if (this.#saveTimer) {
+      clearTimeout(this.#saveTimer);
+      this.#saveTimer = null;
+    }
+    this.#lastLoadedContent = "";
+    navigateHome();
+  }
+
+  /** If `path` is inside any locked zone, shows the unlock modal for the
+   *  first (outermost) locked zone and returns true. Otherwise returns false. */
+  #promptUnlockIfLocked(path: string): boolean {
+    const zones = vaultService.applicableZones(path);
+    const locked = zones.find((z) => !vaultService.isZoneUnlocked(z.id));
+    if (!locked) return false;
+    this.#unlockModal.setZone(locked.id, locked.prefix);
+    this.#unlockModal.show();
+    return true;
+  }
+
+  /** Swap the editor pane for a "this note is in a locked folder" placeholder.
+   *  The unlock modal is already showing on top of this. */
+  #mountLockedPlaceholder(path: string): void {
+    this.#editorWrap.innerHTML = "";
+    this.#editor = null;
+    const zones = vaultService.applicableZones(path);
+    const locked = zones.find((z) => !vaultService.isZoneUnlocked(z.id));
+    const placeholder = document.createElement("div");
+    placeholder.style.cssText =
+      "display:flex;flex-direction:column;align-items:center;justify-content:center;" +
+      "height:100%;padding:32px;text-align:center;color:var(--ls-color-fg-muted,#64748b);" +
+      "font-size:13px;line-height:1.6;gap:8px;";
+    const title = document.createElement("div");
+    title.style.cssText = "font-size:16px;color:var(--ls-color-fg,#e0e0e0);";
+    title.textContent = "🔒 Locked";
+    const sub = document.createElement("div");
+    sub.textContent = locked
+      ? `This file is in the encrypted folder "${locked.prefix}". Enter the passphrase to read it.`
+      : "This file is in an encrypted folder. Enter the passphrase to read it.";
+    placeholder.append(title, sub);
+    this.#editorWrap.appendChild(placeholder);
+    // Clear sidebar panels since we can't parse locked content.
+    this.#outline.headings = [];
+    this.#backlinks.path = path;
+    this.#backlinks.links = [];
   }
 
   async #reloadActiveNote(): Promise<void> {
@@ -1377,10 +1590,17 @@ export class LSApp extends HTMLElement {
 
   // ── New note ──────────────────────────────────────────────────────────────
 
-  async #newNote(folder: string): Promise<void> {
-    const base = `Untitled-${Date.now()}`;
-    const path = folder ? `${folder}/${base}.md` : `${base}.md`;
-    await vaultService.writeNote(path, `# ${base}\n\n`);
+  async #newNote(folder: string, name?: string): Promise<void> {
+    const base = name?.trim() || `Untitled-${Date.now()}`;
+    const filename = base.endsWith(".md") ? base : `${base}.md`;
+    const path = folder ? `${folder}/${filename}` : filename;
+    if ((await vaultService.readNote(path)) !== null) {
+      getToast().show(`${path} already exists`, "info", 4000);
+      navigateTo(path);
+      return;
+    }
+    const title = filename.endsWith(".md") ? filename.slice(0, -3) : filename;
+    await vaultService.writeNote(path, `# ${title}\n\n`);
     navigateTo(path);
   }
 
@@ -1542,6 +1762,7 @@ export class LSApp extends HTMLElement {
   async #signOut(): Promise<void> {
     if (!confirm("Sign out and clear stored credentials?")) return;
     this.#setStatus("syncing", "Signing out…");
+    vaultService.lockAll();
     // Wipe the OPFS git cache so the next sign-in always does a fresh clone.
     if (typeof navigator?.storage?.getDirectory === "function") {
       try {
@@ -1597,6 +1818,12 @@ export class LSApp extends HTMLElement {
     this.#palette.register({ id: "storage-quota", label: "Show storage quota", description: "How much browser storage the vault is using" });
     this.#palette.register({ id: "force-pull", label: "Force pull from remote (discard local changes)", description: "Wipe local cache and re-download everything from GitHub" });
     this.#palette.register({ id: "force-push", label: "Force push to remote (overwrite remote changes)", description: "Push local state to GitHub, discarding any commits that aren't in your local copy" });
+    this.#palette.register({ id: "encrypt-folder", label: "Encrypt folder…", description: "Create an encrypted zone at a folder; files inside are encrypted" });
+    this.#palette.register({ id: "decrypt-folder", label: "Decrypt folder…", description: "Remove an encryption zone; its files become plaintext" });
+    this.#palette.register({ id: "unlock-folder", label: "Unlock folder…", description: "Unwrap a locked encryption zone with its passphrase" });
+    this.#palette.register({ id: "lock-folder", label: "Lock folder…", description: "Drop one encryption zone's identity from memory" });
+    this.#palette.register({ id: "lock-all", label: "Lock all folders", description: "Drop every encryption zone identity from memory" });
+    this.#palette.register({ id: "list-zones", label: "List encryption zones", description: "Show every encrypted folder, its algorithm, and whether it's unlocked" });
     this.#palette.register({ id: "go-home", label: "Go to home", description: "Show the welcome screen" });
     this.#palette.register({ id: "sync", label: "Sync now", description: "Push and pull from GitHub" });
 
@@ -1721,7 +1948,129 @@ export class LSApp extends HTMLElement {
           console.error(err);
         });
         break;
+      case "encrypt-folder":
+        this.#promptEncryptFolder();
+        break;
+      case "decrypt-folder":
+        this.#promptDecryptFolder().catch(console.error);
+        break;
+      case "unlock-folder":
+        this.#promptUnlockFolder();
+        break;
+      case "lock-folder":
+        this.#promptLockFolder();
+        break;
+      case "lock-all":
+        vaultService.lockAll();
+        getToast().show("All encrypted folders locked.", "info", 3000);
+        break;
+      case "list-zones":
+        this.#listZones();
+        break;
     }
+  }
+
+  #promptEncryptFolder(): void {
+    const raw = prompt("Folder to encrypt (e.g. journal/private/):");
+    if (!raw) return;
+    const prefix = raw.replace(/^\/+/, "").replace(/\/+$/, "") + "/";
+    const existing = vaultService.listZones();
+    if (existing.some((z) => z.prefix === prefix)) {
+      getToast().show(`A zone already exists at ${prefix}.`, "warning", 4000);
+      return;
+    }
+    this.#encryptFolderModal.setPrefix(prefix);
+    this.#encryptFolderModal.show();
+  }
+
+  async #promptDecryptFolder(): Promise<void> {
+    const zones = vaultService.listZones();
+    if (zones.length === 0) {
+      getToast().show("No encrypted folders to decrypt.", "info", 3000);
+      return;
+    }
+    const list = zones.map((z, i) => `${i + 1}. ${z.prefix}`).join("\n");
+    const pick = prompt(`Pick a folder to decrypt (enter number):\n${list}`);
+    if (!pick) return;
+    const idx = Number(pick) - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= zones.length) {
+      getToast().show("Invalid selection.", "warning", 3000);
+      return;
+    }
+    const zone = zones[idx]!;
+    if (!vaultService.isZoneUnlocked(zone.id)) {
+      this.#unlockModal.setZone(zone.id, zone.prefix);
+      this.#unlockModal.show();
+      return;
+    }
+    if (!confirm(`Decrypt ${zone.prefix}? Files will become plaintext in git.`)) return;
+    try {
+      await vaultService.removeZone(zone.id);
+      getToast().show(`"${zone.prefix}" decrypted.`, "success", 4000);
+      await this.#loadNoteList();
+    } catch (err) {
+      console.error(err);
+      getToast().show("Failed to decrypt folder. See console.", "error", 4000);
+    }
+  }
+
+  /** Lock badge click handler: lock the zone if currently unlocked, else open
+   *  the unlock modal for it. Badge click always targets exactly one zone. */
+  #toggleZone(prefix: string, currentlyUnlocked: boolean): void {
+    const zone = vaultService.listZones().find((z) => z.prefix === prefix);
+    if (!zone) return;
+    if (currentlyUnlocked) {
+      vaultService.lockZone(zone.id);
+      getToast().show(`"${zone.prefix}" locked.`, "info", 3000);
+      return;
+    }
+    this.#unlockModal.setZone(zone.id, zone.prefix);
+    this.#unlockModal.show();
+  }
+
+  #promptUnlockFolder(): void {
+    const locked = vaultService.listZones().filter((z) => !vaultService.isZoneUnlocked(z.id));
+    if (locked.length === 0) {
+      getToast().show("No locked folders.", "info", 3000);
+      return;
+    }
+    const list = locked.map((z, i) => `${i + 1}. ${z.prefix}`).join("\n");
+    const pick = prompt(`Pick a folder to unlock (enter number):\n${list}`);
+    if (!pick) return;
+    const idx = Number(pick) - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= locked.length) return;
+    const zone = locked[idx]!;
+    this.#unlockModal.setZone(zone.id, zone.prefix);
+    this.#unlockModal.show();
+  }
+
+  #promptLockFolder(): void {
+    const unlocked = vaultService.listZones().filter((z) => vaultService.isZoneUnlocked(z.id));
+    if (unlocked.length === 0) {
+      getToast().show("No unlocked folders.", "info", 3000);
+      return;
+    }
+    const list = unlocked.map((z, i) => `${i + 1}. ${z.prefix}`).join("\n");
+    const pick = prompt(`Pick a folder to lock (enter number):\n${list}`);
+    if (!pick) return;
+    const idx = Number(pick) - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= unlocked.length) return;
+    const zone = unlocked[idx]!;
+    vaultService.lockZone(zone.id);
+    getToast().show(`"${zone.prefix}" locked.`, "info", 3000);
+  }
+
+  #listZones(): void {
+    const zones = vaultService.listZones();
+    if (zones.length === 0) {
+      getToast().show("No encrypted folders in this vault.", "info", 4000);
+      return;
+    }
+    const lines = zones.map((z) => {
+      const state = vaultService.isZoneUnlocked(z.id) ? "unlocked" : "locked";
+      return `${z.prefix} — ${z.algorithm} (${state})`;
+    });
+    alert(`Encryption zones:\n\n${lines.join("\n")}`);
   }
 
   #openSearchTab(): void {

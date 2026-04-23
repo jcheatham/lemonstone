@@ -4,7 +4,14 @@
 import git from "isomorphic-git";
 import { getDB } from "../storage/db.ts";
 import { loadTokens } from "../auth/token-store.ts";
-import { identityCodec } from "../codec/index.ts";
+import {
+  identityCodec,
+  KEYS_JSON_PATH,
+  isKeysFile,
+  layersForPath,
+  type Zone,
+} from "../codec/index.ts";
+import type { CodecDescriptor } from "../codec/index.ts";
 import type { AuthPayload, NoteRecord, CanvasRecord, SyncState } from "../storage/schema.ts";
 import { createGitFS, type GitFS } from "./opfs-adapter.ts";
 import { RateLimiter } from "./rate-limiter.ts";
@@ -30,6 +37,13 @@ function emit(event: WorkerEvent): void {
 function isContentFile(path: string): boolean {
   const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
   return CONTENT_EXTENSIONS.has(ext) || ATTACHMENT_EXTENSIONS.has(ext);
+}
+
+function codecsEqual(a: CodecDescriptor, b: CodecDescriptor): boolean {
+  if (a.scheme !== b.scheme) return false;
+  if (a.scheme === "identity") return true;
+  if (b.scheme !== "age") return false; // narrowing
+  return a.layers.length === b.layers.length && a.layers.every((l, i) => l === b.layers[i]);
 }
 
 export class SyncEngine {
@@ -518,6 +532,13 @@ export class SyncEngine {
     filepath: string,
     conflictPaths: string[]
   ): Promise<void> {
+    // keys.json is managed out-of-band (never through the codec or IDB).
+    // A conflict here means two devices rotated the passphrase simultaneously;
+    // leave the file in OPFS with merge markers for manual resolution.
+    if (filepath === ".lemonstone/keys.json") {
+      conflictPaths.push(filepath);
+      return;
+    }
     const db = await getDB();
     const note = await db.get("notes", filepath);
     const codec = note?.codec ?? { scheme: "identity", version: 1 };
@@ -592,6 +613,25 @@ export class SyncEngine {
     }
   }
 
+  /** Read a file directly from the OPFS working tree. Returns null if missing.
+   *  Used for repo-level config files (e.g. .lemonstone/keys.json) that aren't
+   *  tracked through IndexedDB but ARE committed to git. */
+  async readRepoFile(path: string): Promise<Uint8Array | null> {
+    try {
+      const data = await this.fs.promises.readFile(`/${path}`);
+      return typeof data === "string" ? new TextEncoder().encode(data) : data;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Write a file directly to the OPFS working tree and stage it in git.
+   *  A subsequent sync() call will commit + push it. */
+  async writeRepoFile(path: string, bytes: Uint8Array): Promise<void> {
+    await this.fs.promises.writeFile(`/${path}`, bytes);
+    await git.add({ fs: this.fs, dir: GIT_DIR, filepath: path });
+  }
+
   /** Read a file's blob bytes from a specific ref (branch / remote branch). */
   private async readBlobAt(ref: string, filepath: string): Promise<Uint8Array | null> {
     try {
@@ -621,6 +661,10 @@ export class SyncEngine {
     const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
     if (!headOid) return;
     const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid: headOid });
+    // Always re-derive the codec from keys.json — it's authoritative. An
+    // existing record's codec could be stale (e.g. set to identity from a
+    // pre-encryption reconcile, but keys.json was just added this merge).
+    const zones = await this.loadZones();
 
     const fs = this.fs;
     async function* walkTree(treeOid: string, prefix: string): AsyncGenerator<{ path: string; oid: string }> {
@@ -638,12 +682,17 @@ export class SyncEngine {
       seenPaths.add(path);
       const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
 
+      const expectedCodec = this.codecForPath(path, zones);
+
       if (TEXT_EXTENSIONS.has(ext)) {
         const existing = await db.get("notes", path);
         // Preserve local dirty edits — they'll sync on the next tick.
         if (existing?.syncState === "dirty") continue;
-        // Content unchanged since last reconcile.
-        if (existing && existing.baseSha === oid) continue;
+        // Shortcut: bytes AND codec match — nothing to do. The codec check
+        // catches the case where a new keys.json was just pulled but the
+        // file's bytes didn't change; without it the record would keep its
+        // stale descriptor and reads would misinterpret the bytes.
+        if (existing && existing.baseSha === oid && codecsEqual(existing.codec, expectedCodec)) continue;
 
         const bytes = await this.readBlobBytes(oid);
         if (!bytes) continue;
@@ -655,13 +704,13 @@ export class SyncEngine {
           frontmatter: existing?.frontmatter ?? {},
           syncState: "clean",
           baseSha: oid,
-          codec: existing?.codec ?? { scheme: identityCodec.scheme, version: identityCodec.version },
+          codec: expectedCodec,
         };
         await db.put("notes", record);
       } else if (ext === ".canvas") {
         const existing = await db.get("canvas", path);
         if (existing?.syncState === "dirty") continue;
-        if (existing && existing.baseSha === oid) continue;
+        if (existing && existing.baseSha === oid && codecsEqual(existing.codec, expectedCodec)) continue;
 
         const bytes = await this.readBlobBytes(oid);
         if (!bytes) continue;
@@ -671,7 +720,7 @@ export class SyncEngine {
           updatedAt: Date.now(),
           syncState: "clean",
           baseSha: oid,
-          codec: existing?.codec ?? { scheme: identityCodec.scheme, version: identityCodec.version },
+          codec: expectedCodec,
         };
         await db.put("canvas", record);
       }
@@ -697,6 +746,10 @@ export class SyncEngine {
     // Walk the git tree at HEAD and populate IndexedDB from OPFS.
     const db = await getDB();
     const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid: headOid });
+    // Zone policy drives each record's codec descriptor: without this step a
+    // fresh clone on a second device would stamp every encrypted file as
+    // `identity`, and subsequent reads would hand raw ciphertext to the UI.
+    const zones = await this.loadZones();
 
     async function* walkTree(
       treeOid: string,
@@ -719,6 +772,7 @@ export class SyncEngine {
       const bytes = await this.readBlobBytes(oid);
       if (!bytes) continue;
       const ext = path.slice(path.lastIndexOf(".")).toLowerCase();
+      const codec = this.codecForPath(path, zones);
 
       if (TEXT_EXTENSIONS.has(ext)) {
         const record: NoteRecord = {
@@ -729,7 +783,7 @@ export class SyncEngine {
           frontmatter: {},
           syncState: "clean",
           baseSha: oid,
-          codec: { scheme: identityCodec.scheme, version: identityCodec.version },
+          codec,
         };
         await db.put("notes", record);
       } else if (ext === ".canvas") {
@@ -739,7 +793,7 @@ export class SyncEngine {
           updatedAt: Date.now(),
           syncState: "clean",
           baseSha: oid,
-          codec: { scheme: identityCodec.scheme, version: identityCodec.version },
+          codec,
         };
         await db.put("canvas", record);
       }
@@ -749,6 +803,32 @@ export class SyncEngine {
   private async readOpfsFile(filepath: string): Promise<Uint8Array> {
     const data = await this.fs.promises.readFile(`/${filepath}`);
     return typeof data === "string" ? new TextEncoder().encode(data) : data;
+  }
+
+  /** Read and parse the vault's keys.json (zone policy) from OPFS.
+   *  Returns an empty array if the file is absent or unparseable. We never
+   *  throw here — a missing or corrupt keys.json should degrade to "this is a
+   *  plaintext vault" rather than aborting the entire sync. */
+  private async loadZones(): Promise<Zone[]> {
+    try {
+      const bytes = await this.fs.promises.readFile(`/${KEYS_JSON_PATH}`);
+      const text = typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes);
+      const parsed = JSON.parse(text);
+      return isKeysFile(parsed) ? parsed.zones : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Build the codec descriptor that matches a file's on-disk layering.
+   *  If any zone prefix covers the path, the file is age-encrypted under
+   *  those zones (innermost first in `layers`). Otherwise it's plaintext. */
+  private codecForPath(path: string, zones: readonly Zone[]): CodecDescriptor {
+    const layers = layersForPath(path, zones);
+    if (layers.length === 0) {
+      return { scheme: identityCodec.scheme, version: identityCodec.version };
+    }
+    return { scheme: "age", version: 1, layers };
   }
 
   /**
