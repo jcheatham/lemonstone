@@ -202,7 +202,7 @@ export class LSSwitcher extends HTMLElement {
       const base = path.split("/").pop() ?? path;
       const name = document.createElement("span");
       name.className = "note-name";
-      name.textContent = base.endsWith(".md") ? base.slice(0, -3) : base;
+      name.textContent = base;
 
       item.appendChild(name);
 

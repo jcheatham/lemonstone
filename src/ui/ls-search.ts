@@ -338,7 +338,7 @@ export class LSSearch extends HTMLElement {
       item.dataset["idx"] = String(i);
 
       const base = p.split("/").pop() ?? p;
-      const name = base.endsWith(".md") ? base.slice(0, -3) : base;
+      const name = base;
 
       const title = document.createElement("div");
       title.className = "result-title";

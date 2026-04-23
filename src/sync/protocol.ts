@@ -4,6 +4,7 @@ export type SyncOp =
   | "clone"
   | "sync"
   | "getStatus"
+  | "getHead"
   | "resolveConflict"
   | "forcePull"
   | "forcePush"

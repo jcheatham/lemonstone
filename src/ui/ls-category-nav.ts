@@ -40,8 +40,20 @@ const style = `
     display: flex;
     flex-direction: column;
     padding: 8px 0;
+    flex: 1;
   }
   :host(.rail) .picker-list { display: none; }
+
+  .picker-footer {
+    padding: 8px 14px 10px;
+    border-top: 1px solid var(--ls-color-border, #2a2a3e);
+  }
+  :host(.rail) .picker-footer { display: none; }
+  ::slotted([slot="footer"]) {
+    color: var(--ls-color-fg-muted, #64748b);
+    font-size: 11px;
+    font-family: var(--ls-font-mono, monospace);
+  }
 
   .picker-row {
     display: flex;
@@ -168,6 +180,16 @@ export class LSCategoryNav extends HTMLElement {
         list.appendChild(row);
       }
       body.appendChild(list);
+
+      // Footer area: parent can project a footer element (e.g. build SHA
+      // link) via <x slot="footer">. Only rendered in picker mode — no space
+      // for it when the nav is collapsed to a rail.
+      const footer = document.createElement("div");
+      footer.className = "picker-footer";
+      const slot = document.createElement("slot");
+      slot.name = "footer";
+      footer.appendChild(slot);
+      body.appendChild(footer);
     } else {
       const cat = this.#categories.find(c => c.id === this.#active) ?? this.#categories[0];
       if (!cat) return;

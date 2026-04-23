@@ -57,6 +57,12 @@ self.addEventListener("message", async (e: MessageEvent<WorkerRequest>) => {
         break;
       }
 
+      case "getHead": {
+        const head = await engine.getHead();
+        self.postMessage(ok(id, { head }));
+        break;
+      }
+
       case "resolveConflict": {
         const path = args["path"] as string;
         await engine.resolveConflict(path);

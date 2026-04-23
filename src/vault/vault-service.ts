@@ -151,13 +151,23 @@ export class VaultService extends EventTarget {
 
   private wireSyncEvents(): void {
     this.syncClient.addEventListener("syncCompleted", (e) => {
-      const detail = (e as CustomEvent).detail as { headOid?: string; error?: string; dropped?: string[] } | undefined;
+      const detail = (e as CustomEvent).detail as { headOid?: string; error?: string; dropped?: string[]; message?: string; conflicts?: number } | undefined;
       if (detail?.error === "unsafe_push") {
         // Sync engine refused to push because the merge result was missing
         // files that still exist on remote. Bubble up so the UI can warn.
         this.dispatchEvent(
           Object.assign(new Event("vault:syncError"), {
             detail: { reason: "unsafe_push", dropped: detail.dropped ?? [] },
+          })
+        );
+        return;
+      }
+      if (detail?.error === "failed") {
+        // Engine threw. Surface as a sync error so busy UI clears, but don't
+        // pollute lastSyncAt — this wasn't a successful round-trip.
+        this.dispatchEvent(
+          Object.assign(new Event("vault:syncError"), {
+            detail: { reason: "failed", message: detail.message ?? "Sync failed" },
           })
         );
         return;
@@ -179,19 +189,61 @@ export class VaultService extends EventTarget {
 
   private wireNetworkEvents(): void {
     // Force-sync when the page goes into background (§5.4 "force sync before closing").
+    // Also sync when we come BACK to visible, so a tab/window/PWA that was
+    // dormant catches up with changes made elsewhere. Coalesced via the
+    // in-worker `syncing` mutex — no harm if several fire close together.
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") {
         this.syncClient.call("sync").catch(() => {/* best-effort */});
+      } else if (document.visibilityState === "visible") {
+        this.#wakeSync("visibility");
       }
     });
 
+    // Tab/window focus — a weaker signal than visibilitychange (fires more
+    // often), but catches cases where visibility didn't change (e.g. focus
+    // stolen and returned within the same tab).
+    window.addEventListener("focus", () => this.#wakeSync("focus"));
+
     // Resume sync when coming back online.
-    window.addEventListener("online", () => {
-      this.syncClient.call("sync").catch(console.error);
+    window.addEventListener("online", () => this.#wakeSync("online"));
+
+    // pageshow fires after bfcache restoration on mobile Safari; worth
+    // triggering a sync since the tab may have been frozen for hours.
+    window.addEventListener("pageshow", (e) => {
+      if ((e as PageTransitionEvent).persisted) this.#wakeSync("pageshow");
     });
   }
 
+  /** Wake-up sync. Emits `vault:wakeSync` so the UI can surface a brief
+   *  "checking for updates" indicator, then kicks a sync. If it's been only
+   *  a few seconds since the last successful sync we skip to avoid chatter
+   *  on every focus/visibility jitter — local edits still trigger their
+   *  own debounced syncs through the normal write path. */
+  #wakeSync(source: string): void {
+    const since = this.#lastSyncAt ? Date.now() - this.#lastSyncAt : Number.POSITIVE_INFINITY;
+    if (since < 10_000) return; // coalesce bursts within 10s of a successful sync
+    this.dispatchEvent(
+      Object.assign(new Event("vault:wakeSync"), { detail: { source, msSinceLastSync: since } }),
+    );
+    this.syncClient.call("sync").catch((err) => {
+      console.warn(`[vault] wake-sync (${source}) failed:`, err);
+    });
+  }
+
+  // Timestamp of the last sync that returned a non-empty head OID. Null until
+  // the first successful sync completes in this session.
+  #lastSyncAt: number | null = null;
+
+  get lastSyncAt(): number | null { return this.#lastSyncAt; }
+
   private async onSyncCompleted(headOid?: string): Promise<void> {
+    // Record "last synced" even when headOid is empty. An empty head usually
+    // means the clone/sync hit an empty remote (no commits yet) or an
+    // idempotent no-op; either way the worker did reach GitHub, so from the
+    // user's perspective the vault is in sync with remote.
+    this.#lastSyncAt = Date.now();
+
     // Re-pull zones from keys.json: a remote commit may have created or
     // removed a zone, or this may be the first sync after sign-in on a
     // fresh device (in which case keys.json only just landed in OPFS).
@@ -202,10 +254,14 @@ export class VaultService extends EventTarget {
     );
 
     // Re-read any notes whose updatedAt changed since we last indexed them.
+    // `readNote` on a record inside a locked zone throws ZoneLockedError —
+    // that's expected in a mixed-codec vault and must not abort the rest of
+    // the post-sync flow, or the UI will never see `vault:synced`.
     const records = await this.storage.listNotes();
     for (const record of records) {
       const lastSeen = this.noteUpdatedAt.get(record.path) ?? 0;
-      if (record.updatedAt > lastSeen) {
+      if (record.updatedAt <= lastSeen) continue;
+      try {
         const content = await this.storage.readNote(record.path);
         if (content !== null) {
           this.indexNote(record.path, content, record.frontmatter);
@@ -215,6 +271,10 @@ export class VaultService extends EventTarget {
               detail: { path: record.path, source: "sync" },
             })
           );
+        }
+      } catch (err) {
+        if ((err as Error)?.name !== "ZoneLockedError") {
+          console.warn("[vault] onSyncCompleted: readNote failed for", record.path, err);
         }
       }
     }
@@ -414,6 +474,12 @@ export class VaultService extends EventTarget {
   async readRepoFile(path: string): Promise<Uint8Array | null> {
     const res = await this.syncClient.call("readRepoFile", { path });
     return (res.result as { bytes: Uint8Array | null }).bytes;
+  }
+
+  /** Current HEAD OID, or "" if unknown / repo not initialized. */
+  async getHead(): Promise<string> {
+    const res = await this.syncClient.call("getHead");
+    return (res.result as { head: string }).head;
   }
 
   async writeRepoFile(path: string, bytes: Uint8Array): Promise<void> {

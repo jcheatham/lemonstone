@@ -97,6 +97,13 @@ const style = `
     text-overflow: ellipsis;
     color: var(--ls-color-fg, #e0e0e0);
     border-radius: 0;
+    /* Long-press on mobile can accidentally trigger iOS selection callouts
+       or text selection, which fights with our own rename-on-long-press.
+       These two lines keep the press clean. The name still shows a caret
+       when the inline input takes over. */
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
   }
   .file-item:hover { background: rgba(255,255,255,0.05); }
   .file-item.active {
@@ -116,6 +123,10 @@ const style = `
     padding: 1px 5px;
     outline: none;
     min-width: 0;
+    /* Re-enable text selection inside the rename input — the file-item it
+       replaces disables selection to keep long-press clean. */
+    -webkit-user-select: auto;
+    user-select: auto;
   }
   .empty-hint {
     padding: 16px 12px;
@@ -496,17 +507,66 @@ export class LSFileTree extends HTMLElement {
     div.tabIndex = 0;
 
     const base = path.split("/").pop() ?? path;
-    const displayName = base.endsWith(".md") ? base.slice(0, -3) : base;
 
     const nameSpan = document.createElement("span");
     nameSpan.className = "file-name";
-    nameSpan.textContent = displayName;
+    nameSpan.textContent = base;
     div.appendChild(nameSpan);
 
     let clickTimer: ReturnType<typeof setTimeout> | null = null;
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+    let longPressFired = false;
+    let pressStart: { x: number; y: number } | null = null;
+    const LONG_PRESS_MS = 500;
+    const MOVE_CANCEL_PX = 10;
 
-    div.addEventListener("click", () => {
-      // Single click opens; double-click triggers rename.
+    const cancelLongPress = (): void => {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+      pressStart = null;
+    };
+
+    div.addEventListener("pointerdown", (e) => {
+      // Only primary button for mouse; touch/pen always proceed.
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      longPressFired = false;
+      pressStart = { x: e.clientX, y: e.clientY };
+      longPressTimer = setTimeout(() => {
+        longPressTimer = null;
+        longPressFired = true;
+        // Cancel any pending single-click open; we're going into rename.
+        if (clickTimer) { clearTimeout(clickTimer); clickTimer = null; }
+        // A short haptic buzz confirms "you're now editing" on phones that
+        // support it. Noop on desktop / iOS Safari.
+        if (typeof navigator.vibrate === "function") navigator.vibrate(10);
+        this.#startRename(div, nameSpan, path);
+      }, LONG_PRESS_MS);
+    });
+
+    div.addEventListener("pointermove", (e) => {
+      if (!pressStart) return;
+      const dx = Math.abs(e.clientX - pressStart.x);
+      const dy = Math.abs(e.clientY - pressStart.y);
+      // A scroll gesture starts with a pointerdown on a file; if the finger
+      // moves past the threshold we bail out so we don't mis-fire rename.
+      if (dx > MOVE_CANCEL_PX || dy > MOVE_CANCEL_PX) cancelLongPress();
+    });
+
+    div.addEventListener("pointerup", cancelLongPress);
+    div.addEventListener("pointercancel", cancelLongPress);
+    div.addEventListener("pointerleave", cancelLongPress);
+
+    div.addEventListener("click", (e) => {
+      // A long-press is followed by a synthetic click on most touch devices —
+      // swallow it so we don't also open the note behind the rename input.
+      if (longPressFired) {
+        longPressFired = false;
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       if (clickTimer) {
         clearTimeout(clickTimer);
         clickTimer = null;
@@ -519,6 +579,16 @@ export class LSFileTree extends HTMLElement {
           new CustomEvent("file-open", { bubbles: true, composed: true, detail: { path } })
         );
       }, 220);
+    });
+
+    // Right-click / keyboard context key → rename too. Matches the same
+    // "I want to edit this name" intent that long-press expresses on touch,
+    // and replaces the browser's default context menu (which on mobile can
+    // show text-selection actions that don't apply to a virtual list row).
+    div.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      cancelLongPress();
+      this.#startRename(div, nameSpan, path);
     });
 
     div.addEventListener("keydown", (e) => {
@@ -537,22 +607,29 @@ export class LSFileTree extends HTMLElement {
 
   #startRename(div: HTMLElement, nameSpan: HTMLElement, oldPath: string): void {
     const base = oldPath.split("/").pop() ?? oldPath;
-    const displayName = base.endsWith(".md") ? base.slice(0, -3) : base;
     const dir = oldPath.includes("/") ? oldPath.slice(0, oldPath.lastIndexOf("/") + 1) : "";
 
     const input = document.createElement("input");
     input.className = "rename-input";
-    input.value = displayName;
+    input.value = base;
     nameSpan.replaceWith(input);
 
-    // Select the name without triggering further rename.
-    requestAnimationFrame(() => { input.select(); });
+    // Pre-select just the stem (before the final dot) so typing replaces the
+    // name without clobbering the extension — the common case.
+    requestAnimationFrame(() => {
+      input.focus();
+      const dot = base.lastIndexOf(".");
+      if (dot > 0) input.setSelectionRange(0, dot);
+      else input.select();
+    });
 
     const commit = (): void => {
       const newName = input.value.trim();
-      if (newName && newName !== displayName) {
-        const ext = base.includes(".") ? base.slice(base.lastIndexOf(".")) : ".md";
-        const newPath = dir + newName + (newName.endsWith(ext) ? "" : ext);
+      if (newName && newName !== base) {
+        // If the user typed a name without an extension, preserve the original
+        // extension so "my-note" renaming "foo.md" stays a .md file.
+        const ext = base.includes(".") ? base.slice(base.lastIndexOf(".")) : "";
+        const newPath = dir + (newName.includes(".") ? newName : newName + ext);
         this.dispatchEvent(
           new CustomEvent("file-rename", {
             bubbles: true,
@@ -562,7 +639,7 @@ export class LSFileTree extends HTMLElement {
         );
       }
       // Restore span whether or not rename happened.
-      nameSpan.textContent = input.value.trim() || displayName;
+      nameSpan.textContent = input.value.trim() || base;
       input.replaceWith(nameSpan);
       div.focus();
     };

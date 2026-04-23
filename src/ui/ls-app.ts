@@ -305,6 +305,20 @@ const style = `
  * Supports both the current nested layout (daily/YYYY/MM/DD/events.md) and
  * the legacy flat layout (daily/YYYY-MM-DD.md).
  */
+/** Coarse relative-time label ("just now", "3m ago", "2h ago", "yesterday"). */
+function formatAgo(ms: number): string {
+  if (ms < 30_000) return "just now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d === 1) return "yesterday";
+  return `${d}d ago`;
+}
+
 function dailyDateFromPath(path: string, dailyFolder: string): string | null {
   const prefix = dailyFolder ? `${dailyFolder}/` : "";
   if (!path.startsWith(prefix)) return null;
@@ -391,6 +405,7 @@ export class LSApp extends HTMLElement {
     this.#buildLayout();
     this.#registerCommands();
     this.#wireVaultEvents();
+    this.#startStatusTicker();
     this.#init().catch(console.error);
     document.addEventListener("keydown", this.#onGlobalKey);
   }
@@ -589,19 +604,9 @@ export class LSApp extends HTMLElement {
       "color:var(--ls-color-fg-muted,#64748b);font-size:11px;text-decoration:none;" +
       "font-family:var(--ls-font-mono,monospace);white-space:nowrap;";
 
-    const buildLabel = document.createElement("a");
-    buildLabel.textContent = `build ${__BUILD_SHA__}`;
-    buildLabel.title = "Source commit for this build";
-    buildLabel.target = "_blank";
-    buildLabel.rel = "noopener noreferrer";
-    buildLabel.style.cssText = `margin-left:auto;${mutedLinkCss}`;
-    if (__BUILD_REPO__ && __BUILD_SHA__ !== "dev") {
-      buildLabel.href = `https://github.com/${__BUILD_REPO__}/commit/${__BUILD_SHA__}`;
-    }
-
     this.#repoLabel = document.createElement("span");
     this.#repoLabel.style.cssText =
-      `margin-left:12px;${mutedLinkCss}overflow:hidden;text-overflow:ellipsis;max-width:240px;`;
+      `margin-left:auto;${mutedLinkCss}overflow:hidden;text-overflow:ellipsis;max-width:260px;`;
 
     const signOutBtn = document.createElement("button");
     signOutBtn.textContent = "Sign out";
@@ -611,7 +616,25 @@ export class LSApp extends HTMLElement {
     signOutBtn.addEventListener("mouseenter", () => { signOutBtn.style.color = "var(--ls-color-fg,#e0e0e0)"; });
     signOutBtn.addEventListener("mouseleave", () => { signOutBtn.style.color = "var(--ls-color-fg-muted,#64748b)"; });
     signOutBtn.addEventListener("click", () => this.#signOut());
-    statusBar.append(this.#statusDot, this.#statusText, buildLabel, this.#repoLabel, signOutBtn);
+    statusBar.append(this.#statusDot, this.#statusText, this.#repoLabel, signOutBtn);
+
+    // Build label lives at the bottom of the category picker via a named
+    // slot on ls-category-nav. Projected from this (the app) as light-DOM
+    // content so the nav stays decoupled from build metadata. Links to the
+    // source repo; the specific commit is visible in the label itself.
+    const buildLabel = document.createElement("a");
+    buildLabel.slot = "footer";
+    buildLabel.textContent = `build ${__BUILD_SHA__}`;
+    buildLabel.target = "_blank";
+    buildLabel.rel = "noopener noreferrer";
+    buildLabel.style.cssText = mutedLinkCss;
+    if (__BUILD_REPO__) {
+      buildLabel.href = `https://github.com/${__BUILD_REPO__}`;
+      buildLabel.title = `Open ${__BUILD_REPO__} on GitHub (this build: ${__BUILD_SHA__})`;
+    } else {
+      buildLabel.title = "Source commit for this build";
+    }
+    this.#categoryNav.appendChild(buildLabel);
     // Status bar is intentionally NOT appended to #main. It sits at the root
     // so it stays visible regardless of which pane is showing on mobile.
     this.#statusBar = statusBar;
@@ -1188,6 +1211,13 @@ export class LSApp extends HTMLElement {
     }
     const tokens = await loadTokens();
     if (tokens) this.#setRepoLabel(tokens.repoFullName);
+    // Populate the status-bar sha from the already-cloned HEAD so we don't
+    // have to wait for the first syncCompleted to get it on screen. If this
+    // is a brand-new session the resolve will return "" and the sync-complete
+    // event later will fill it in.
+    vaultService.getHead()
+      .then((head) => { if (head) this.#setRepoSha(head); })
+      .catch(() => { /* best-effort */ });
     // Tokens exist — kick off a sync (auto-clones on first run).
     vaultService.sync().catch(console.error);
     await this.#loadNoteList();
@@ -1213,11 +1243,16 @@ export class LSApp extends HTMLElement {
       const sep = document.createTextNode("#");
       const shaLink = document.createElement("a");
       shaLink.textContent = this.#currentSha.slice(0, 7);
-      shaLink.href = `https://github.com/${this.#currentRepo}/commit/${this.#currentSha}`;
-      shaLink.target = "_blank";
-      shaLink.rel = "noopener noreferrer";
-      shaLink.title = "Last synced commit";
-      shaLink.style.cssText = "color:inherit;text-decoration:none;";
+      // Local navigation — drill into the History category instead of popping
+      // a new tab at GitHub. The user almost always wants "what changed
+      // recently" rather than the static GitHub commit view.
+      shaLink.href = "#";
+      shaLink.title = "Last synced commit — open History";
+      shaLink.style.cssText = "color:inherit;text-decoration:none;cursor:pointer;";
+      shaLink.addEventListener("click", (e) => {
+        e.preventDefault();
+        this.#drillInto("history");
+      });
       this.#repoLabel.append(sep, shaLink);
     }
   }
@@ -1323,6 +1358,23 @@ export class LSApp extends HTMLElement {
       vaultService.addEventListener(ev, () => this.#evictIfActiveLocked());
     }
 
+    // Page came back from dormant — user expects a fresh view of the vault
+    // even if they haven't explicitly triggered anything.
+    vaultService.addEventListener("vault:wakeSync", () => {
+      this.#setStatus("syncing", "Checking for updates…");
+      // Safety net: if the sync never terminates (worker error, engine
+      // throw, network stall, etc.), the status bar shouldn't lie forever.
+      // vault:synced / vault:syncError both call setStatus themselves and
+      // will override this. The timer is cleared implicitly because those
+      // handlers reset the transient text.
+      if (this.#wakeWatchdog) clearTimeout(this.#wakeWatchdog);
+      this.#wakeWatchdog = setTimeout(() => {
+        if (this.#statusText.textContent === "Checking for updates…") {
+          this.#setStatus("error", "Sync timed out — tap Sync to retry");
+        }
+      }, 20_000);
+    });
+
     vaultService.addEventListener("vault:synced", (e) => {
       this.#setStatus("ok", "Synced");
       const headOid = (e as CustomEvent).detail?.headOid as string | undefined;
@@ -1370,9 +1422,46 @@ export class LSApp extends HTMLElement {
     });
   }
 
+  #statusTransientText = "";
+  #statusTransientUntil = 0;
+  #wakeWatchdog: ReturnType<typeof setTimeout> | null = null;
+
   #setStatus(state: "ok" | "syncing" | "error" | "conflict", text: string): void {
+    // Non-ok states are informative by themselves ("Saving…", "Sync failed");
+    // the ok state, on the other hand, is the natural resting point — we want
+    // "Synced 3m ago" there, not a static "Ready". Treat incoming ok text as
+    // a short-lived override that fades back to the idle clock.
+    if (state === "ok") {
+      this.#statusTransientText = text;
+      this.#statusTransientUntil = Date.now() + 3500;
+    } else {
+      this.#statusTransientText = text;
+      this.#statusTransientUntil = 0; // persists until the next setStatus
+    }
     this.#statusDot.className = `status-dot ${state}`;
-    this.#statusText.textContent = text;
+    this.#renderStatusText();
+  }
+
+  #renderStatusText(): void {
+    const now = Date.now();
+    const last = vaultService.lastSyncAt;
+    this.#statusText.title = last
+      ? `Last synced at ${new Date(last).toLocaleString()}`
+      : "Not synced yet this session";
+    const transientActive = this.#statusTransientText && (this.#statusTransientUntil === 0 || now < this.#statusTransientUntil);
+    if (transientActive) {
+      this.#statusText.textContent = this.#statusTransientText;
+      return;
+    }
+    // Idle: show relative last-sync time. Falls through to "Ready" only until
+    // the first sync completes.
+    this.#statusText.textContent = last ? `Synced ${formatAgo(now - last)}` : "Ready";
+  }
+
+  #startStatusTicker(): void {
+    // One timer, runs forever. 15s granularity is fine for "3m ago" labels
+    // and cheap enough not to matter on mobile.
+    setInterval(() => this.#renderStatusText(), 15_000);
   }
 
   // ── Note list ─────────────────────────────────────────────────────────────

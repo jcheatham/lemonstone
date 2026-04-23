@@ -49,7 +49,10 @@ function codecsEqual(a: CodecDescriptor, b: CodecDescriptor): boolean {
 export class SyncEngine {
   private fs!: GitFS;
   private readonly rateLimiter = new RateLimiter();
-  private syncing = false; // simple mutex — one sync at a time in worker
+  // Tracks the single in-flight sync. Concurrent callers coalesce onto it
+  // (see `sync()`), so we never early-return a resolved promise while a real
+  // sync is still running — which would leave UI busy-states hanging.
+  private syncPromise: Promise<void> | null = null;
   private tokens: AuthPayload | null = null;
 
   async init(): Promise<void> {
@@ -236,17 +239,34 @@ export class SyncEngine {
   // ── Steady-state sync ──────────────────────────────────────────────────────
 
   async sync(): Promise<void> {
-    if (this.syncing) return; // skip if already in progress
-    this.syncing = true;
+    // Coalesce concurrent callers onto the same in-flight promise. Early
+    // returning here would leave downstream UI waiting for a `syncCompleted`
+    // event that never arrives (the in-flight sync emits only once, and this
+    // call's promise would already have resolved).
+    if (this.syncPromise) return this.syncPromise;
+    this.syncPromise = this.#runSync().finally(() => {
+      this.syncPromise = null;
+    });
+    return this.syncPromise;
+  }
 
+  async #runSync(): Promise<void> {
     try {
       if (!(await this.isInitialized())) {
         await this.clone();
         return;
       }
       await this.syncOnce();
-    } finally {
-      this.syncing = false;
+    } catch (err) {
+      // A throw anywhere inside the sync pipeline would otherwise leave any
+      // UI that saw `syncStarted` hanging forever. Emit a terminal event
+      // before re-throwing so listeners can transition out of their busy
+      // state. The caller's promise still rejects as before.
+      const branch = this.tokens?.repoDefaultBranch ?? "main";
+      const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
+      const message = err instanceof Error ? err.message : String(err);
+      emit({ event: "syncCompleted", data: { op: "sync", error: "failed", message, headOid } });
+      throw err;
     }
   }
 
@@ -328,7 +348,10 @@ export class SyncEngine {
         for (const path of conflicts) {
           emit({ event: "conflictDetected", data: { path } });
         }
-        // Do not push if there are unresolved conflicts.
+        // Do not push if there are unresolved conflicts. Still emit a
+        // terminal event so busy-indicators in the UI can transition out.
+        const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
+        emit({ event: "syncCompleted", data: { op: "sync", conflicts: conflicts.length, headOid } });
         return;
       }
     }
@@ -610,6 +633,19 @@ export class SyncEngine {
         });
         conflictPaths.push(filepath);
       }
+    }
+  }
+
+  /** Return the OID of the current HEAD commit, or "" if the repo isn't
+   *  initialized / the ref can't be resolved. Used by the UI to label the
+   *  repo with its current sha independently of sync events. */
+  async getHead(): Promise<string> {
+    const tokens = this.tokens ?? await loadTokens().catch(() => null);
+    const branch = tokens?.repoDefaultBranch ?? "main";
+    try {
+      return await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch });
+    } catch {
+      return "";
     }
   }
 

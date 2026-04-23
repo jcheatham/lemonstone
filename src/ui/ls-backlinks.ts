@@ -85,7 +85,7 @@ export class LSBacklinks extends HTMLElement {
         const item = document.createElement("div");
         item.className = "link-item";
         const base = p.split("/").pop() ?? p;
-        item.textContent = base.endsWith(".md") ? base.slice(0, -3) : base;
+        item.textContent = base;
         item.title = p;
         item.addEventListener("click", () => {
           this.dispatchEvent(
