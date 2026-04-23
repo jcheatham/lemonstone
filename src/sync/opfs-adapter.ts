@@ -58,9 +58,11 @@ function pathParts(p: string): string[] {
 class OPFSAdapter {
   private root!: FileSystemDirectoryHandle;
 
+  constructor(private readonly dirName: string) {}
+
   async init(): Promise<void> {
     const storageRoot = await navigator.storage.getDirectory();
-    this.root = await storageRoot.getDirectoryHandle("lemonstone-git", {
+    this.root = await storageRoot.getDirectoryHandle(this.dirName, {
       create: true,
     });
   }
@@ -256,12 +258,12 @@ function dirStat(mtimeMs: number): StatResult {
 
 export type GitFS = { promises: FsPromises };
 
-export async function createGitFS(): Promise<GitFS> {
+export async function createGitFS(dirName: string): Promise<GitFS> {
   if (typeof navigator?.storage?.getDirectory === "function") {
-    const adapter = new OPFSAdapter();
+    const adapter = new OPFSAdapter(dirName);
     await adapter.init();
     return adapter;
   }
   // LightningFS fallback for browsers without OPFS.
-  return new LightningFS("lemonstone-git") as unknown as GitFS;
+  return new LightningFS(dirName) as unknown as GitFS;
 }

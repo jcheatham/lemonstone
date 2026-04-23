@@ -1,7 +1,6 @@
 // PAT-based auth. Validates a GitHub Personal Access Token via api.github.com
 // (CORS-enabled) and stores it using the same AuthPayload schema as device flow.
 
-import { saveTokens } from "./token-store.ts";
 import type { AuthPayload } from "../storage/schema.ts";
 import { GITHUB_API_BASE } from "../config/github-app.ts";
 
@@ -52,12 +51,15 @@ export async function listUserRepos(token: string): Promise<GitHubRepo[]> {
   return res.json() as Promise<GitHubRepo[]>;
 }
 
-export async function savePATAuth(
+/** Build (but don't persist) an AuthPayload for a PAT. The caller is
+ *  responsible for stashing it into the right vault's auth store —
+ *  typically via the vault multiplexer's addVault flow. */
+export function buildPATAuthPayload(
   token: string,
   repoFullName: string,
   repoDefaultBranch: string
-): Promise<AuthPayload> {
-  const payload: AuthPayload = {
+): AuthPayload {
+  return {
     accessToken: token,
     refreshToken: "",
     // PATs don't have OAuth-style expiry; set far future so existing expiry
@@ -68,6 +70,4 @@ export async function savePATAuth(
     repoFullName,
     repoDefaultBranch,
   };
-  await saveTokens(payload);
-  return payload;
 }

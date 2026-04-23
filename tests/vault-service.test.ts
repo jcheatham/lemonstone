@@ -55,7 +55,13 @@ describe("VaultService", () => {
 
   beforeEach(() => {
     store.clear();
-    vault = new VaultService();
+    vault = new VaultService({
+      vaultId: "test-vault",
+      dbName: "test-db",
+      opfsDir: "test-opfs",
+      repoFullName: "owner/repo",
+      repoDefaultBranch: "main",
+    });
   });
 
   // ── Basic read/write ───────────────────────────────────────────────────────

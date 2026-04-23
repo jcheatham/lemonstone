@@ -1,4 +1,5 @@
 import { getDB } from "./db.ts";
+// `getDB` used via this.db()
 import type {
   NoteRecord,
   CanvasRecord,
@@ -23,7 +24,14 @@ function ageDescriptor(layers: readonly string[]): CodecDescriptor {
 }
 
 export class StorageAdapter {
-  constructor(private readonly zoneService: ZoneService) {}
+  constructor(
+    private readonly zoneService: ZoneService,
+    private readonly dbName: string,
+  ) {}
+
+  private db() {
+    return getDB(this.dbName);
+  }
 
   // ── Codec pipeline ────────────────────────────────────────────────────────
 
@@ -75,7 +83,7 @@ export class StorageAdapter {
   ): Promise<void> {
     const plainBytes = encoder.encode(plaintextContent);
     const { bytes, codec } = await this.encodeForPath(plainBytes, path);
-    const db = await getDB();
+    const db = await this.db();
     const record: NoteRecord = {
       path,
       content: bytes,
@@ -90,7 +98,7 @@ export class StorageAdapter {
   }
 
   async readNote(path: string): Promise<string | null> {
-    const db = await getDB();
+    const db = await this.db();
     const record = await db.get("notes", path);
     if (!record) return null;
     const decoded = await this.decode(record.content, path, record.codec);
@@ -98,17 +106,17 @@ export class StorageAdapter {
   }
 
   async readNoteRecord(path: string): Promise<NoteRecord | null> {
-    const db = await getDB();
+    const db = await this.db();
     return (await db.get("notes", path)) ?? null;
   }
 
   async listNotes(): Promise<NoteRecord[]> {
-    const db = await getDB();
+    const db = await this.db();
     return db.getAll("notes");
   }
 
   async deleteNote(path: string): Promise<void> {
-    const db = await getDB();
+    const db = await this.db();
     await db.delete("notes", path);
   }
 
@@ -121,7 +129,7 @@ export class StorageAdapter {
   ): Promise<void> {
     const plainBytes = encoder.encode(plaintextJson);
     const { bytes, codec } = await this.encodeForPath(plainBytes, path);
-    const db = await getDB();
+    const db = await this.db();
     const record: CanvasRecord = {
       path,
       content: bytes,
@@ -134,7 +142,7 @@ export class StorageAdapter {
   }
 
   async readCanvas(path: string): Promise<string | null> {
-    const db = await getDB();
+    const db = await this.db();
     const record = await db.get("canvas", path);
     if (!record) return null;
     const decoded = await this.decode(record.content, path, record.codec);
@@ -142,12 +150,12 @@ export class StorageAdapter {
   }
 
   async readCanvasRecord(path: string): Promise<CanvasRecord | null> {
-    const db = await getDB();
+    const db = await this.db();
     return (await db.get("canvas", path)) ?? null;
   }
 
   async clearCanvasConflict(path: string): Promise<void> {
-    const db = await getDB();
+    const db = await this.db();
     const record = await db.get("canvas", path);
     if (!record) return;
     const { conflict: _conflict, ...rest } = record;
@@ -156,12 +164,12 @@ export class StorageAdapter {
   }
 
   async listCanvas(): Promise<CanvasRecord[]> {
-    const db = await getDB();
+    const db = await this.db();
     return db.getAll("canvas");
   }
 
   async deleteCanvas(path: string): Promise<void> {
-    const db = await getDB();
+    const db = await this.db();
     await db.delete("canvas", path);
   }
 
@@ -173,7 +181,7 @@ export class StorageAdapter {
     meta: Pick<AttachmentRecord, "syncState" | "baseSha">
   ): Promise<void> {
     const { bytes, codec } = await this.encodeForPath(plaintextBlob, path);
-    const db = await getDB();
+    const db = await this.db();
     const record: AttachmentRecord = {
       path,
       blob: bytes,
@@ -187,14 +195,14 @@ export class StorageAdapter {
   }
 
   async readAttachment(path: string): Promise<Uint8Array | null> {
-    const db = await getDB();
+    const db = await this.db();
     const record = await db.get("attachments", path);
     if (!record) return null;
     return this.decode(record.blob, path, record.codec);
   }
 
   async deleteAttachment(path: string): Promise<void> {
-    const db = await getDB();
+    const db = await this.db();
     await db.delete("attachments", path);
   }
 
@@ -206,7 +214,7 @@ export class StorageAdapter {
   ): Promise<void> {
     // Snapshot path is a synthetic sentinel; no zones apply, so it's always plaintext.
     // (If index-at-rest encryption is added later, route through encodeForPath.)
-    const db = await getDB();
+    const db = await this.db();
     const record: IndexesSnapshotRecord = {
       key: "v1",
       data: plaintextData,
@@ -221,7 +229,7 @@ export class StorageAdapter {
     data: Uint8Array;
     meta: Omit<IndexesSnapshotRecord, "data">;
   } | null> {
-    const db = await getDB();
+    const db = await this.db();
     const record = await db.get("indexes-snapshot", "v1");
     if (!record) return null;
     return {
@@ -238,13 +246,13 @@ export class StorageAdapter {
   // ── Config ─────────────────────────────────────────────────────────────────
 
   async getConfig<T>(key: string): Promise<T | null> {
-    const db = await getDB();
+    const db = await this.db();
     const record = await db.get("config", key);
     return record ? (record.value as T) : null;
   }
 
   async setConfig(key: string, value: unknown): Promise<void> {
-    const db = await getDB();
+    const db = await this.db();
     const record: ConfigRecord = { key, value };
     await db.put("config", record);
   }
@@ -252,18 +260,18 @@ export class StorageAdapter {
   // ── Tombstones ─────────────────────────────────────────────────────────────
 
   async writeTombstone(path: string): Promise<void> {
-    const db = await getDB();
+    const db = await this.db();
     const record: Tombstone = { path, deletedAt: Date.now() };
     await db.put("tombstones", record);
   }
 
   async deleteTombstone(path: string): Promise<void> {
-    const db = await getDB();
+    const db = await this.db();
     await db.delete("tombstones", path);
   }
 
   async listTombstones(): Promise<Tombstone[]> {
-    const db = await getDB();
+    const db = await this.db();
     return db.getAll("tombstones");
   }
 
@@ -322,7 +330,7 @@ export class StorageAdapter {
    *  Updates the record's codec descriptor and marks it dirty for sync.
    */
   async reencodeRecord(path: string, targetLayers: readonly string[]): Promise<void> {
-    const db = await getDB();
+    const db = await this.db();
     const note = await db.get("notes", path);
     if (note) {
       const currentLayers = note.codec.scheme === "age" ? note.codec.layers : [];
@@ -358,7 +366,7 @@ export class StorageAdapter {
     prefix: string,
     mutator: (currentLayers: readonly string[]) => readonly string[],
   ): Promise<void> {
-    const db = await getDB();
+    const db = await this.db();
     const toRecode: string[] = [];
     for (const n of await db.getAll("notes")) {
       if (n.path.startsWith(prefix)) toRecode.push(n.path);

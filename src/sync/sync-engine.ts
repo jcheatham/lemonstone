@@ -46,6 +46,15 @@ function codecsEqual(a: CodecDescriptor, b: CodecDescriptor): boolean {
   return a.layers.length === b.layers.length && a.layers.every((l, i) => l === b.layers[i]);
 }
 
+export interface SyncEngineConfig {
+  /** Opaque vault id; emitted back in events so the client routes them correctly. */
+  readonly vaultId: string;
+  /** IndexedDB database name holding this vault's data (including its auth record). */
+  readonly dbName: string;
+  /** OPFS directory this vault's git working tree lives in. */
+  readonly opfsDir: string;
+}
+
 export class SyncEngine {
   private fs!: GitFS;
   private readonly rateLimiter = new RateLimiter();
@@ -55,18 +64,26 @@ export class SyncEngine {
   private syncPromise: Promise<void> | null = null;
   private tokens: AuthPayload | null = null;
 
+  constructor(private readonly config: SyncEngineConfig) {}
+
   async init(): Promise<void> {
-    this.fs = await createGitFS();
+    this.fs = await createGitFS(this.config.opfsDir);
+  }
+
+  /** Emit a worker event with vaultId tagged onto the data, so the main
+   *  thread can route it regardless of which engine produced it. */
+  private emit(event: { event: WorkerEvent["event"]; data: Record<string, unknown> }): void {
+    emit({ event: event.event, data: { ...event.data, vaultId: this.config.vaultId } });
   }
 
   // ── Token management ───────────────────────────────────────────────────────
 
   private async getValidTokens(): Promise<AuthPayload> {
     if (!this.tokens) {
-      this.tokens = await loadTokens();
+      this.tokens = await loadTokens(this.config.dbName);
     }
     if (!this.tokens) {
-      emit({ event: "authRequired", data: {} });
+      emit({ event: "authRequired", data: { vaultId: this.config.vaultId } });
       throw new Error("Not authenticated");
     }
     return this.tokens;
@@ -75,7 +92,7 @@ export class SyncEngine {
   private makeHttp() {
     return createGitHttpPlugin(
       this.rateLimiter,
-      (resumeAt) => emit({ event: "rateLimited", data: { resumeAt } })
+      (resumeAt) => this.emit({ event: "rateLimited", data: { resumeAt } })
     );
   }
 
@@ -111,7 +128,7 @@ export class SyncEngine {
     const repoUrl = `https://github.com/${tokens.repoFullName}.git`;
     const branch = tokens.repoDefaultBranch;
 
-    emit({ event: "syncStarted", data: { op: "clone" } });
+    this.emit({ event: "syncStarted", data: { op: "clone" } });
 
     console.log("[sync] cloning", repoUrl, "ref:", branch);
     try {
@@ -142,7 +159,7 @@ export class SyncEngine {
       console.warn("[sync] clone failed with non-HTTP error, falling back to local init:", cloneErr);
       await git.init({ fs: this.fs, dir: GIT_DIR, defaultBranch: branch });
       await git.addRemote({ fs: this.fs, dir: GIT_DIR, remote: "origin", url: repoUrl });
-      emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
+      this.emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
       return;
     }
 
@@ -156,15 +173,15 @@ export class SyncEngine {
       const localBranches = await git.listBranches({ fs: this.fs, dir: GIT_DIR }).catch(() => [] as string[]);
       const remoteBranches = await git.listBranches({ fs: this.fs, dir: GIT_DIR, remote: "origin" }).catch(() => [] as string[]);
       console.warn("[sync] local branches:", localBranches, "remote branches:", remoteBranches);
-      emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
+      this.emit({ event: "syncCompleted", data: { op: "clone", headOid: "" } });
       return;
     }
     try {
       await this.populateIndexedDB(headOid);
-      emit({ event: "syncCompleted", data: { op: "clone", headOid } });
+      this.emit({ event: "syncCompleted", data: { op: "clone", headOid } });
     } catch (popErr) {
       console.error("[sync] populateIndexedDB failed:", popErr);
-      emit({ event: "syncCompleted", data: { op: "clone", headOid } });
+      this.emit({ event: "syncCompleted", data: { op: "clone", headOid } });
     }
   }
 
@@ -178,8 +195,8 @@ export class SyncEngine {
    * Auth tokens and config are preserved.
    */
   async forcePull(): Promise<void> {
-    emit({ event: "syncStarted", data: { op: "forcePull" } });
-    const db = await getDB();
+    this.emit({ event: "syncStarted", data: { op: "forcePull" } });
+    const db = await getDB(this.config.dbName);
     await Promise.all([
       db.clear("notes"),
       db.clear("canvas"),
@@ -189,10 +206,10 @@ export class SyncEngine {
     // Remove the OPFS git dir so isInitialized() returns false and clone() runs.
     try {
       const storageRoot = await navigator.storage.getDirectory();
-      await storageRoot.removeEntry("lemonstone-git", { recursive: true });
+      await storageRoot.removeEntry(this.config.opfsDir, { recursive: true });
     } catch { /* not present — that's fine */ }
     // Re-init the adapter so it points at a fresh directory.
-    this.fs = await createGitFS();
+    this.fs = await createGitFS(this.config.opfsDir);
     await this.clone();
   }
 
@@ -202,7 +219,7 @@ export class SyncEngine {
    * only after an explicit user confirmation at the UI layer.
    */
   async forcePush(): Promise<void> {
-    emit({ event: "syncStarted", data: { op: "forcePush" } });
+    this.emit({ event: "syncStarted", data: { op: "forcePush" } });
     const tokens = await this.getValidTokens();
     const http = this.makeHttp();
     const authHeaders = this.makeAuthHeaders(tokens);
@@ -233,7 +250,7 @@ export class SyncEngine {
     await this.markStagedClean(staged);
 
     const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
-    emit({ event: "syncCompleted", data: { op: "forcePush", headOid } });
+    this.emit({ event: "syncCompleted", data: { op: "forcePush", headOid } });
   }
 
   // ── Steady-state sync ──────────────────────────────────────────────────────
@@ -265,7 +282,7 @@ export class SyncEngine {
       const branch = this.tokens?.repoDefaultBranch ?? "main";
       const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
       const message = err instanceof Error ? err.message : String(err);
-      emit({ event: "syncCompleted", data: { op: "sync", error: "failed", message, headOid } });
+      this.emit({ event: "syncCompleted", data: { op: "sync", error: "failed", message, headOid } });
       throw err;
     }
   }
@@ -278,7 +295,7 @@ export class SyncEngine {
     const authHeaders = this.makeAuthHeaders(tokens);
     const branch = tokens.repoDefaultBranch;
 
-    emit({ event: "syncStarted", data: { op: "sync" } });
+    this.emit({ event: "syncStarted", data: { op: "sync" } });
 
     // 1. Fetch latest from origin. An empty remote has no refs — that's fine.
     let remoteIsEmpty = false;
@@ -324,7 +341,7 @@ export class SyncEngine {
     const dirtyPaths = await this.stageDirtyFiles();
     if (dirtyPaths.length === 0 && !remoteIsEmpty && !(await this.hasRemoteChanges(branch))) {
       const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
-      emit({ event: "syncCompleted", data: { op: "sync", changed: 0, headOid } });
+      this.emit({ event: "syncCompleted", data: { op: "sync", changed: 0, headOid } });
       return;
     }
 
@@ -346,12 +363,12 @@ export class SyncEngine {
       const conflicts = await this.mergeRemote(branch, tokens);
       if (conflicts.length > 0) {
         for (const path of conflicts) {
-          emit({ event: "conflictDetected", data: { path } });
+          this.emit({ event: "conflictDetected", data: { path } });
         }
         // Do not push if there are unresolved conflicts. Still emit a
         // terminal event so busy-indicators in the UI can transition out.
         const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
-        emit({ event: "syncCompleted", data: { op: "sync", conflicts: conflicts.length, headOid } });
+        this.emit({ event: "syncCompleted", data: { op: "sync", conflicts: conflicts.length, headOid } });
         return;
       }
     }
@@ -366,7 +383,7 @@ export class SyncEngine {
       if (dropped.length > 0) {
         const msg = `Refusing to push: merge result is missing ${dropped.length} file(s) that exist on remote and were not explicitly deleted: ${dropped.slice(0, 3).join(", ")}${dropped.length > 3 ? "…" : ""}`;
         console.error("[sync]", msg, dropped);
-        emit({ event: "syncCompleted", data: { op: "sync", error: "unsafe_push", dropped } });
+        this.emit({ event: "syncCompleted", data: { op: "sync", error: "unsafe_push", dropped } });
         throw new Error(msg);
       }
     }
@@ -399,14 +416,14 @@ export class SyncEngine {
     }
 
     const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
-    emit({ event: "syncCompleted", data: { op: "sync", headOid } });
+    this.emit({ event: "syncCompleted", data: { op: "sync", headOid } });
   }
 
   // ── Conflict resolution callback ───────────────────────────────────────────
 
   async resolveConflict(path: string): Promise<void> {
     // User has saved a resolved version — clear conflict flag and re-sync.
-    const db = await getDB();
+    const db = await getDB(this.config.dbName);
     const note = await db.get("notes", path);
     if (note && note.syncState === "conflict") {
       await db.put("notes", { ...note, syncState: "dirty" as SyncState });
@@ -422,7 +439,7 @@ export class SyncEngine {
 
   private async markStagedClean(paths: string[]): Promise<void> {
     if (paths.length === 0) return;
-    const db = await getDB();
+    const db = await getDB(this.config.dbName);
     for (const p of paths) {
       // Any tombstone for this path was just honored by the push — clear it.
       await db.delete("tombstones", p);
@@ -435,7 +452,7 @@ export class SyncEngine {
   }
 
   private async stageDirtyFiles(): Promise<string[]> {
-    const db = await getDB();
+    const db = await getDB(this.config.dbName);
     const staged: string[] = [];
 
     const notes = await db.getAll("notes");
@@ -562,7 +579,7 @@ export class SyncEngine {
       conflictPaths.push(filepath);
       return;
     }
-    const db = await getDB();
+    const db = await getDB(this.config.dbName);
     const note = await db.get("notes", filepath);
     const codec = note?.codec ?? { scheme: "identity", version: 1 };
 
@@ -581,7 +598,7 @@ export class SyncEngine {
 
       // Preserve the loser as a sibling file.
       const conflictPath = makeConflictPath(filepath, new Date(theirsTime));
-      const db2 = await getDB();
+      const db2 = await getDB(this.config.dbName);
       await db2.put("notes", {
         path: conflictPath,
         content: loser,
@@ -625,7 +642,7 @@ export class SyncEngine {
       // v1 identity codec: 3-way merge with conflict markers.
       const conflictContent = await this.readOpfsFile(filepath);
       if (note) {
-        const db2 = await getDB();
+        const db2 = await getDB(this.config.dbName);
         await db2.put("notes", {
           ...note,
           content: conflictContent,
@@ -640,7 +657,7 @@ export class SyncEngine {
    *  initialized / the ref can't be resolved. Used by the UI to label the
    *  repo with its current sha independently of sync events. */
   async getHead(): Promise<string> {
-    const tokens = this.tokens ?? await loadTokens().catch(() => null);
+    const tokens = this.tokens ?? await loadTokens(this.config.dbName).catch(() => null);
     const branch = tokens?.repoDefaultBranch ?? "main";
     try {
       return await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch });
@@ -692,7 +709,7 @@ export class SyncEngine {
     // Walks the current tree and compares each blob's OID to the note's baseSha.
     // Status-matrix-based detection doesn't work here because a fast-forward
     // merge leaves workdir === HEAD for every file (nothing looks "modified").
-    const db = await getDB();
+    const db = await getDB(this.config.dbName);
     const branch = this.tokens?.repoDefaultBranch ?? "main";
     const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch }).catch(() => "");
     if (!headOid) return;
@@ -780,7 +797,7 @@ export class SyncEngine {
 
   private async populateIndexedDB(headOid: string): Promise<void> {
     // Walk the git tree at HEAD and populate IndexedDB from OPFS.
-    const db = await getDB();
+    const db = await getDB(this.config.dbName);
     const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid: headOid });
     // Zone policy drives each record's codec descriptor: without this step a
     // fresh clone on a second device would stamp every encrypted file as
@@ -901,7 +918,7 @@ export class SyncEngine {
 
   private async getAuthor(tokens: AuthPayload): Promise<{ name: string; email: string }> {
     // Use stored author info or a sensible default.
-    const db = await getDB();
+    const db = await getDB(this.config.dbName);
     const stored = await db.get("config", "gitAuthor");
     if (stored?.value) {
       return stored.value as { name: string; email: string };
@@ -961,7 +978,7 @@ export class SyncEngine {
       this.treePaths(remoteOid),
     ]);
 
-    const db = await getDB();
+    const db = await getDB(this.config.dbName);
     const tombstoned = new Set((await db.getAll("tombstones")).map((t) => t.path));
 
     const dropped: string[] = [];
@@ -1066,14 +1083,14 @@ export class SyncEngine {
    * to their target-commit content.
    */
   async restoreToCommit(targetOid: string): Promise<void> {
-    emit({ event: "syncStarted", data: { op: "restore" } });
+    this.emit({ event: "syncStarted", data: { op: "restore" } });
     const branch = this.tokens?.repoDefaultBranch ?? "main";
     const headOid = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: branch });
 
     const headBlobs = await this.treeBlobs(headOid);
     const targetBlobs = await this.treeBlobs(targetOid);
 
-    const db = await getDB();
+    const db = await getDB(this.config.dbName);
 
     // 1. Files present in HEAD but not in target: remove + tombstone.
     for (const [path] of headBlobs) {
@@ -1112,7 +1129,7 @@ export class SyncEngine {
     await this.populateIndexedDB(newHead);
 
     // 5. Hand back to normal sync for the actual push.
-    emit({ event: "syncCompleted", data: { op: "restore", headOid: newHead } });
+    this.emit({ event: "syncCompleted", data: { op: "restore", headOid: newHead } });
   }
 
   private async hasRemoteChanges(branch: string): Promise<boolean> {
@@ -1148,7 +1165,7 @@ export class SyncEngine {
     if (msg.includes("401") || msg.includes("403")) {
       emit({ event: "authRequired", data: { reason: msg } });
     } else if (msg.includes("404")) {
-      emit({ event: "syncCompleted", data: { error: "repo_not_found" } });
+      this.emit({ event: "syncCompleted", data: { error: "repo_not_found" } });
     }
   }
 }

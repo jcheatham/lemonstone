@@ -3,8 +3,8 @@ import { getDB } from "../storage/db.ts";
 const CRYPTO_KEY_STORE = "config";
 const CRYPTO_KEY_RECORD = "authCryptoKey";
 
-async function getOrCreateKey(): Promise<CryptoKey> {
-  const db = await getDB();
+async function getOrCreateKey(dbName: string): Promise<CryptoKey> {
+  const db = await getDB(dbName);
   const stored = await db.get(CRYPTO_KEY_STORE, CRYPTO_KEY_RECORD);
   if (stored?.value) {
     return stored.value as CryptoKey;
@@ -18,8 +18,8 @@ async function getOrCreateKey(): Promise<CryptoKey> {
   return key;
 }
 
-export async function encryptTokenPayload(payload: string): Promise<string> {
-  const key = await getOrCreateKey();
+export async function encryptTokenPayload(dbName: string, payload: string): Promise<string> {
+  const key = await getOrCreateKey(dbName);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encoded = new TextEncoder().encode(payload);
   const ciphertext = await crypto.subtle.encrypt(
@@ -34,8 +34,8 @@ export async function encryptTokenPayload(payload: string): Promise<string> {
   return btoa(String.fromCharCode(...combined));
 }
 
-export async function decryptTokenPayload(stored: string): Promise<string> {
-  const key = await getOrCreateKey();
+export async function decryptTokenPayload(dbName: string, stored: string): Promise<string> {
+  const key = await getOrCreateKey(dbName);
   const combined = Uint8Array.from(atob(stored), (c) => c.charCodeAt(0));
   const iv = combined.slice(0, 12);
   const ciphertext = combined.slice(12);

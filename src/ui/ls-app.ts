@@ -4,13 +4,14 @@
 //   <ls-file-tree>, <ls-editor>, <ls-backlinks>, <ls-outline>,
 //   <ls-command-palette>, <ls-switcher>, hash router, vaultService.
 
-import { isAuthenticated, loadTokens } from "../auth/index.ts";
-import { vaultService } from "../vault/index.ts";
-import { getDB } from "../storage/db.ts";
-import { currentRoute, navigateTo, navigateHome } from "./router.ts";
+import { vaultService, multiplexer } from "../vault/index.ts";
+import { MANIFEST_DB_NAME } from "../vault/manifest.ts";
+import type { AuthPayload } from "../storage/schema.ts";
+import { currentRoute, navigateTo, navigateHome, navigateToVault, navigateToVaults } from "./router.ts";
 import type { Route } from "./router.ts";
 import { parseHeadings } from "./ls-outline.ts";
 import "./ls-modal.ts";
+import type { LSModal } from "./ls-modal.ts";
 import "./ls-file-tree.ts";
 import "./ls-backlinks.ts";
 import "./ls-outline.ts";
@@ -26,6 +27,8 @@ import "./ls-canvas.ts";
 import type { LSCanvas } from "./ls-canvas.ts";
 import "./ls-history.ts";
 import type { LSHistory, CommitSummary } from "./ls-history.ts";
+import "./ls-vaults.ts";
+import type { LSVaults } from "./ls-vaults.ts";
 import "./ls-unlock-modal.ts";
 import type { LSUnlockModal } from "./ls-unlock-modal.ts";
 import "./ls-enable-encryption-modal.ts";
@@ -384,6 +387,8 @@ export class LSApp extends HTMLElement {
   #history!: LSHistory;
   #activeCommitOid = "";
   #commandsPanel!: HTMLElement;
+  #vaults!: LSVaults;
+  #authModal!: LSModal;
   #unlockModal!: LSUnlockModal;
   #encryptFolderModal!: LSEncryptFolderModal;
   readonly #dailyFolder = "daily";
@@ -435,12 +440,20 @@ export class LSApp extends HTMLElement {
     this.#authOverlay.classList.remove("visible");
   }
 
+  /** Show the auth overlay with a freshly reset modal. Avoids stale "Connected!"
+   *  text lingering between add-vault attempts. */
+  #showAuthOverlay(): void {
+    if (this.#authModal) this.#authModal.reset();
+    this.#authOverlay.classList.add("visible");
+  }
+
   // ── Build DOM ─────────────────────────────────────────────────────────────
 
   #buildLayout(): void {
     // Category nav column (wide picker or narrow rail)
     this.#categoryNav = document.createElement("ls-category-nav") as LSCategoryNav;
     this.#categoryNav.categories = [
+      { id: "vaults", label: "Vaults" },
       { id: "files", label: "Files" },
       { id: "calendar", label: "Calendar" },
       { id: "search", label: "Search" },
@@ -560,7 +573,30 @@ export class LSApp extends HTMLElement {
     this.#commandsPanel.className = "panel-content";
     this.#commandsPanel.dataset["category"] = "commands";
 
-    this.#categoryPanel.append(filesPanel, calendarPanel, searchPanel, historyPanel, this.#commandsPanel);
+    // Vaults panel: list + switch/add/remove/rename.
+    const vaultsPanel = document.createElement("div");
+    vaultsPanel.className = "panel-content";
+    vaultsPanel.dataset["category"] = "vaults";
+    this.#vaults = document.createElement("ls-vaults") as LSVaults;
+    this.#vaults.style.cssText = "flex:1;min-height:0;";
+    this.#vaults.addEventListener("vault-switch", (e) => {
+      const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
+      navigateToVault(vaultId);
+    });
+    this.#vaults.addEventListener("vault-remove", (e) => {
+      const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
+      this.#handleVaultRemove(vaultId).catch(console.error);
+    });
+    this.#vaults.addEventListener("vault-rename", (e) => {
+      const { vaultId, label } = (e as CustomEvent<{ vaultId: string; label: string }>).detail;
+      multiplexer.renameVault(vaultId, label).catch(console.error);
+    });
+    this.#vaults.addEventListener("vault-add", () => {
+      this.#showAuthOverlay();
+    });
+    vaultsPanel.appendChild(this.#vaults);
+
+    this.#categoryPanel.append(vaultsPanel, filesPanel, calendarPanel, searchPanel, historyPanel, this.#commandsPanel);
     this.#showPanel(this.#previewedCategory);
 
     // If the panel is dimmed (rail was expanded back to picker), any click
@@ -642,13 +678,15 @@ export class LSApp extends HTMLElement {
     // Auth overlay
     this.#authOverlay = document.createElement("div");
     this.#authOverlay.id = "auth-overlay";
-    const modal = document.createElement("ls-modal");
+    const modal = document.createElement("ls-modal") as LSModal;
     modal.id = "auth-modal";
-    modal.addEventListener("auth-complete", () => {
+    modal.addEventListener("auth-complete", (e) => {
+      const detail = (e as CustomEvent<{ tokens: AuthPayload }>).detail;
       this.hideAuthOverlay();
-      this.#postAuthInit().catch(console.error);
+      this.#postAuthAddVault(detail.tokens).catch(console.error);
     });
     this.#authOverlay.appendChild(modal);
+    this.#authModal = modal;
 
     // Vault encryption modals
     this.#unlockModal = document.createElement("ls-unlock-modal") as LSUnlockModal;
@@ -1242,23 +1280,33 @@ export class LSApp extends HTMLElement {
   // ── Init ─────────────────────────────────────────────────────────────────
 
   async #init(): Promise<void> {
-    const authed = await isAuthenticated();
-    if (!authed) {
-      this.#authOverlay.classList.add("visible");
+    // main.ts has already awaited multiplexer.boot() and attempted to open
+    // the last-used vault. Here we catch up on the UI side.
+    await this.#refreshVaultsList();
+    const vaults = await multiplexer.listVaults();
+    if (vaults.length === 0) {
+      // Empty state — first-run. Show the auth overlay which will produce a
+      // brand-new vault on success.
+      this.#showAuthOverlay();
+      navigateToVaults();
       return;
     }
-    const tokens = await loadTokens();
-    if (tokens) this.#setRepoLabel(tokens.repoFullName);
-    // Populate the status-bar sha from the already-cloned HEAD so we don't
-    // have to wait for the first syncCompleted to get it on screen. If this
-    // is a brand-new session the resolve will return "" and the sync-complete
-    // event later will fill it in.
-    vaultService.getHead()
-      .then((head) => { if (head) this.#setRepoSha(head); })
-      .catch(() => { /* best-effort */ });
-    // Tokens exist — kick off a sync (auto-clones on first run).
-    vaultService.sync().catch(console.error);
-    await this.#loadNoteList();
+    const currentId = multiplexer.currentVaultId;
+    if (!currentId) {
+      // Manifest has vaults but none is current (all removed, or the
+      // currentVaultId pointer is stale). Route to vaults list.
+      navigateToVaults();
+      return;
+    }
+    const current = multiplexer.currentVault;
+    if (current) {
+      this.#setRepoLabel(current.repoFullName);
+      vaultService.getHead()
+        .then((head) => { if (head) this.#setRepoSha(head); })
+        .catch(() => { /* best-effort */ });
+      vaultService.sync().catch(console.error);
+      await this.#loadNoteList();
+    }
     await this.#handleRoute(currentRoute());
   }
 
@@ -1306,29 +1354,27 @@ export class LSApp extends HTMLElement {
     this.#renderRepoLabel();
   }
 
-  async #postAuthInit(): Promise<void> {
-    const tokens = await loadTokens();
-    if (tokens) this.#setRepoLabel(tokens.repoFullName);
-
-    this.#setStatus("syncing", "Cloning repository…");
+  /** Called after the auth modal produces a new (vaultless) set of tokens.
+   *  Registers a new vault in the manifest, opens it, and routes there. */
+  async #postAuthAddVault(tokens: AuthPayload): Promise<void> {
+    this.#setStatus("syncing", "Connecting vault…");
     try {
-      await vaultService.clone();
+      const record = await multiplexer.addVault(tokens);
+      // Transition out of the empty Vaults panel as soon as the record
+      // exists. handleRoute will then drive the open() and drill into Files.
+      navigateToVault(record.id);
+      // Also force-open here so this call's promise doesn't resolve before
+      // the vault is usable — callers (like sync kicks) depend on it.
+      await multiplexer.open(record.id);
+      this.#setRepoLabel(record.repoFullName);
+      vaultService.sync().catch(console.error);
+      this.#setStatus("ok", "Ready");
+      await this.#loadNoteList();
     } catch (err) {
-      console.warn("Clone skipped or failed:", err);
+      console.error("[vault] Adding vault failed:", err);
+      this.#setStatus("error", `Could not connect vault: ${(err as Error).message ?? err}`);
+      getToast().show(`Could not connect vault: ${(err as Error).message ?? err}`, "error", 6000);
     }
-
-    // Zones (if any) are loaded lazily — identities stay locked until the
-    // user opens a file in one, at which point we intercept the
-    // ZoneLockedError and show the unlock modal. No eager prompt here.
-    await this.#continuePostAuthInit();
-  }
-
-  async #continuePostAuthInit(): Promise<void> {
-    // Sync ensures IndexedDB is populated even if clone was a no-op.
-    vaultService.sync().catch(console.error);
-    this.#setStatus("ok", "Ready");
-    await this.#loadNoteList();
-    await this.#handleRoute(currentRoute());
   }
 
   async #handleUnlock(zoneId: string, passphrase: string): Promise<void> {
@@ -1375,6 +1421,24 @@ export class LSApp extends HTMLElement {
     vaultService.addEventListener("vault:ready", () => {
       this.#loadNoteList().catch(console.error);
       this.#setStatus("ok", "Ready");
+    });
+
+    // Keep the Vaults panel and the status-bar repo label in sync with the
+    // manifest. `vaults:changed` fires on add/remove/rename;
+    // `vaults:currentChanged` fires on switch.
+    multiplexer.addEventListener("vaults:changed", () => {
+      this.#refreshVaultsList().catch(console.error);
+    });
+    multiplexer.addEventListener("vaults:currentChanged", () => {
+      this.#refreshVaultsList().catch(console.error);
+      const cur = multiplexer.currentVault;
+      if (cur) {
+        this.#setRepoLabel(cur.repoFullName);
+        this.#currentSha = "";
+        this.#renderRepoLabel();
+      } else {
+        this.#setRepoLabel("");
+      }
     });
 
     vaultService.addEventListener("note:changed", () => {
@@ -1482,7 +1546,9 @@ export class LSApp extends HTMLElement {
 
   #renderStatusText(): void {
     const now = Date.now();
-    const last = vaultService.lastSyncAt;
+    // `vaultService` is a Proxy over the current VaultService; reading any
+    // property on it before a vault is open throws. Guard every access.
+    const last = multiplexer.currentVault ? multiplexer.currentVault.lastSyncAt : null;
     this.#statusText.title = last
       ? `Last synced at ${new Date(last).toLocaleString()}`
       : "Not synced yet this session";
@@ -1503,6 +1569,30 @@ export class LSApp extends HTMLElement {
   }
 
   // ── Note list ─────────────────────────────────────────────────────────────
+
+  async #refreshVaultsList(): Promise<void> {
+    if (!this.#vaults) return;
+    const vaults = await multiplexer.listVaults();
+    this.#vaults.vaults = vaults;
+    this.#vaults.currentId = multiplexer.currentVaultId;
+  }
+
+  async #handleVaultRemove(vaultId: string): Promise<void> {
+    try {
+      await multiplexer.removeVault(vaultId);
+      // If what's left is a single vault, open it automatically for
+      // convenience. Otherwise route to the list.
+      const remaining = await multiplexer.listVaults();
+      if (remaining.length === 1) {
+        navigateToVault(remaining[0]!.id);
+      } else {
+        navigateToVaults();
+      }
+    } catch (err) {
+      console.error("Vault removal failed:", err);
+      this.#setStatus("error", "Could not remove vault");
+    }
+  }
 
   #refreshZoneBadges(): void {
     this.#fileTree.zones = vaultService.listZones().map((z) => ({
@@ -1542,15 +1632,57 @@ export class LSApp extends HTMLElement {
   };
 
   async #handleRoute(route: Route): Promise<void> {
-    if (route.type === "home") {
+    if (route.type === "vaults") {
       this.#activePath = "";
       this.#showWelcome();
       this.#fileTree.activePath = "";
       this.#outline.headings = [];
       this.#backlinks.links = [];
       this.#conflictBanner.classList.remove("visible");
-      this.#updateMobileState();
+      this.#drillInto("vaults");
       return;
+    }
+    if (route.type === "home") {
+      // Legacy home or no-hash: route to current vault if open, else vaults.
+      const currentId = multiplexer.currentVaultId;
+      if (currentId) {
+        navigateToVault(currentId);
+      } else {
+        navigateToVaults();
+      }
+      return;
+    }
+    if (route.type === "vault") {
+      // Ensure the requested vault is the current one; switch if not.
+      if (multiplexer.currentVaultId !== route.vaultId) {
+        try { await multiplexer.open(route.vaultId); }
+        catch (err) {
+          console.error("[route] failed to open vault", route.vaultId, err);
+          getToast().show(`Could not open vault: ${(err as Error).message ?? err}`, "error", 5000);
+          navigateToVaults();
+          return;
+        }
+      }
+      this.#activePath = "";
+      this.#showWelcome();
+      this.#fileTree.activePath = "";
+      this.#outline.headings = [];
+      this.#backlinks.links = [];
+      this.#conflictBanner.classList.remove("visible");
+      // Drill into Files by default — after opening a vault the user expects
+      // to see their notes, not the vault picker.
+      this.#drillInto("files");
+      return;
+    }
+    // route.type === "note"
+    if (multiplexer.currentVaultId !== route.vaultId) {
+      try { await multiplexer.open(route.vaultId); }
+      catch (err) {
+        console.error("[route] failed to open vault", route.vaultId, err);
+        getToast().show(`Could not open vault: ${(err as Error).message ?? err}`, "error", 5000);
+        navigateToVaults();
+        return;
+      }
     }
     await this.#openNote(route.path);
     // Route-driven opens (deep links, palette quick-open, switcher picks, daily
@@ -1886,33 +2018,23 @@ export class LSApp extends HTMLElement {
       });
   }
 
+  /** Sign out of every configured vault — the multi-vault equivalent of
+   *  "nuke everything and start over." Per-vault removal is available from
+   *  the Vaults panel. */
   async #signOut(): Promise<void> {
-    if (!confirm("Sign out and clear stored credentials?")) return;
+    const vaults = await multiplexer.listVaults();
+    if (vaults.length === 0) { location.reload(); return; }
+    if (!confirm(`Sign out of all ${vaults.length} vault(s) and clear their local data?`)) return;
     this.#setStatus("syncing", "Signing out…");
-    vaultService.lockAll();
-    // Wipe the OPFS git cache so the next sign-in always does a fresh clone.
-    if (typeof navigator?.storage?.getDirectory === "function") {
-      try {
-        const root = await navigator.storage.getDirectory();
-        await root.removeEntry("lemonstone-git", { recursive: true });
-      } catch { /* directory may not exist yet */ }
+    for (const v of vaults) {
+      try { await multiplexer.removeVault(v.id); }
+      catch (err) { console.warn("[sign-out] removeVault failed:", v.id, err); }
     }
-    // Clear each object store individually — deleteDatabase would block because
-    // the idb library holds an open connection that never explicitly closes.
+    // Also drop the manifest itself so the next launch's boot() treats this
+    // as a fresh install.
     try {
-      const db = await getDB();
-      await Promise.all([
-        db.clear("auth"),
-        db.clear("notes"),
-        db.clear("canvas"),
-        db.clear("attachments"),
-        db.clear("indexes-snapshot"),
-        db.clear("config"),
-        db.clear("tombstones"),
-      ]);
-    } catch (err) {
-      console.error("Failed to clear local DB:", err);
-    }
+      await indexedDB.deleteDatabase(MANIFEST_DB_NAME);
+    } catch { /* best effort */ }
     location.reload();
   }
 

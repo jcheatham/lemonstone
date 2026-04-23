@@ -4,9 +4,10 @@
 // Step 2: Repository entry
 //
 // Events (bubbles, composed):
-//   auth-complete — fires when token + repo have been saved
+//   auth-complete — detail: { tokens: AuthPayload } — caller persists and
+//                   registers the vault (multi-vault aware).
 
-import { validatePAT, fetchRepo, savePATAuth } from "../auth/index.ts";
+import { validatePAT, fetchRepo, buildPATAuthPayload } from "../auth/index.ts";
 import type { GitHubUser } from "../auth/index.ts";
 
 const style = `
@@ -92,6 +93,16 @@ export class LSModal extends HTMLElement {
     const sheet = document.createElement("style");
     sheet.textContent = style;
     this.#shadow.appendChild(sheet);
+    this.#renderStep1();
+  }
+
+  /** Reset the modal back to its initial empty state so it's ready for the
+   *  next add-vault attempt. Safe to call any time — if the shadow isn't
+   *  attached yet, connectedCallback's #renderStep1 already handled it. */
+  reset(): void {
+    if (!this.#shadow) return;
+    this.#user = null;
+    this.#token = "";
     this.#renderStep1();
   }
 
@@ -246,11 +257,15 @@ export class LSModal extends HTMLElement {
       status.textContent = "Connecting…";
       try {
         const repo = await fetchRepo(this.#token, repoName);
-        await savePATAuth(this.#token, repo.full_name, repo.default_branch);
+        const tokens = buildPATAuthPayload(this.#token, repo.full_name, repo.default_branch);
         status.className = "status success-msg";
         status.textContent = "Connected! Loading your vault…";
         this.dispatchEvent(
-          new CustomEvent("auth-complete", { bubbles: true, composed: true })
+          new CustomEvent("auth-complete", {
+            bubbles: true,
+            composed: true,
+            detail: { tokens },
+          })
         );
       } catch (err) {
         input.classList.add("error");

@@ -35,16 +35,30 @@ export interface TagInfo {
   count: number;
 }
 
+export interface VaultServiceConfig {
+  readonly vaultId: string;
+  readonly dbName: string;
+  readonly opfsDir: string;
+  readonly repoFullName: string;
+  readonly repoDefaultBranch: string;
+}
+
 export class VaultService extends EventTarget {
   private readonly zoneService: ZoneService;
   private readonly storage: StorageAdapter;
-  private readonly syncClient = new SyncClient();
+  private readonly syncClient: SyncClient;
+  readonly config: VaultServiceConfig;
 
-  constructor() {
+  constructor(config: VaultServiceConfig) {
     super();
+    this.config = config;
     this.zoneService = new ZoneService();
-    this.storage = new StorageAdapter(this.zoneService);
+    this.storage = new StorageAdapter(this.zoneService, config.dbName);
+    this.syncClient = new SyncClient(config.vaultId);
   }
+
+  get vaultId(): string { return this.config.vaultId; }
+  get repoFullName(): string { return this.config.repoFullName; }
 
   // ── In-memory indexes (rebuilt on load, updated incrementally) ─────────────
 
@@ -841,6 +855,21 @@ export class VaultService extends EventTarget {
       this.syncClient.call("sync").catch(console.error);
     }, 2000);
   }
+
+  /** Free per-vault resources: in-memory indexes, timers, sync-client
+   *  event subscriptions. Called by the multiplexer when the user switches
+   *  to a different vault or removes this one. */
+  dispose(): void {
+    if (this.snapshotTimer) { clearTimeout(this.snapshotTimer); this.snapshotTimer = null; }
+    if (this.syncDebounceTimer) { clearTimeout(this.syncDebounceTimer); this.syncDebounceTimer = null; }
+    this.outgoing.clear();
+    this.incoming.clear();
+    this.tagIndex.clear();
+    this.tagsByNote.clear();
+    this.noteUpdatedAt.clear();
+    this.zoneService.lockAll();
+    this.syncClient.dispose();
+  }
 }
 
 // ── Module-level helpers ────────────────────────────────────────────────────
@@ -865,4 +894,5 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export const vaultService = new VaultService();
+// Module singleton removed — see src/vault/multiplexer.ts for the
+// exported facade. Instantiate VaultService directly via the multiplexer.

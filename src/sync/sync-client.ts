@@ -15,8 +15,10 @@ type Resolver = {
   reject: (e: WorkerError) => void;
 };
 
-export class SyncClient extends EventTarget {
-  private readonly worker: Worker;
+/** Shared worker instance — one per tab. Multiple SyncClient facades can
+ *  bind to it, each scoped to a single vault. */
+class WorkerBus extends EventTarget {
+  readonly worker: Worker;
   private readonly pending = new Map<string, Resolver>();
 
   constructor() {
@@ -60,4 +62,46 @@ export class SyncClient extends EventTarget {
   }
 }
 
-export const syncClient = new SyncClient();
+let sharedBus: WorkerBus | null = null;
+function getBus(): WorkerBus {
+  if (!sharedBus) sharedBus = new WorkerBus();
+  return sharedBus;
+}
+
+/** Per-vault facade. Each call auto-tags vaultId so the worker can route it.
+ *  Events from the worker are re-dispatched only when they match this vault. */
+export class SyncClient extends EventTarget {
+  private readonly bus = getBus();
+  private readonly forwardListener: (e: Event) => void;
+
+  constructor(private readonly vaultId: string) {
+    super();
+    this.forwardListener = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { vaultId?: string } | undefined;
+      // Events from the engine carry their own vaultId; only fire for ours.
+      // Undefined vaultId is treated as "any" for backward-compat safety.
+      if (detail?.vaultId && detail.vaultId !== this.vaultId) return;
+      this.dispatchEvent(Object.assign(new Event(e.type), { detail }));
+    };
+    for (const type of ["syncStarted", "syncProgress", "syncCompleted", "conflictDetected", "authRequired", "rateLimited"] as SyncEventType[]) {
+      this.bus.addEventListener(type, this.forwardListener);
+    }
+  }
+
+  /** Detach this facade's listeners from the shared bus. Call on vault close. */
+  dispose(): void {
+    for (const type of ["syncStarted", "syncProgress", "syncCompleted", "conflictDetected", "authRequired", "rateLimited"] as SyncEventType[]) {
+      this.bus.removeEventListener(type, this.forwardListener);
+    }
+  }
+
+  call(op: SyncOp, args: Record<string, unknown> = {}): Promise<WorkerResponse> {
+    return this.bus.call(op, { ...args, vaultId: this.vaultId });
+  }
+}
+
+/** One-off calls that don't need a specific vault (currently unused — openVault
+ *  / closeVault are sent via this anonymous path). */
+export function callWorker(op: SyncOp, args: Record<string, unknown> = {}): Promise<WorkerResponse> {
+  return getBus().call(op, args);
+}

@@ -1,5 +1,7 @@
-export { VaultService, vaultService } from "./vault-service.ts";
-export type { VaultEventType, TagInfo } from "./vault-service.ts";
+export { VaultService } from "./vault-service.ts";
+export type { VaultEventType, TagInfo, VaultServiceConfig } from "./vault-service.ts";
+export { vaultService, multiplexer, VaultMultiplexer } from "./multiplexer.ts";
+export type { VaultRecord } from "./manifest.ts";
 export { parseFrontmatter } from "./frontmatter.ts";
 export type { ParsedFrontmatter } from "./frontmatter.ts";
 export { extractAllTags, extractInlineTags, extractFrontmatterTags } from "./tags.ts";
