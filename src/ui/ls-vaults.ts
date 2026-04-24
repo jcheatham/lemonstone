@@ -1,12 +1,11 @@
 // <ls-vaults> — drill-in panel for the Vaults category.
 //
-// Lists configured vaults, shows which is current, and exposes per-vault
-// actions (switch / rename / remove) plus an Add-vault footer button.
+// Contains a vault list + a footer "+ Add vault" action. Clicking a row
+// fires `vault-select` (not `vault-switch`) — the main pane's detail card
+// then displays actions for the selected vault.
 //
 // Events (bubbles, composed):
-//   vault-switch — detail: { vaultId }
-//   vault-remove — detail: { vaultId }
-//   vault-rename — detail: { vaultId, label }
+//   vault-select — detail: { vaultId }
 //   vault-add    — user asked to add a new vault
 
 import type { VaultRecord } from "../vault/manifest.ts";
@@ -16,7 +15,6 @@ const style = `
   .header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     padding: 8px 12px 4px;
     font-size: 11px;
     font-weight: 600;
@@ -43,7 +41,7 @@ const style = `
     min-height: 34px;
   }
   .row:hover { background: rgba(255,255,255,0.04); }
-  .row.current {
+  .row.selected {
     border-left-color: var(--ls-color-accent, #7c6af7);
     background: rgba(124,106,247,0.08);
   }
@@ -62,37 +60,33 @@ const style = `
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .actions { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; flex-shrink: 0; }
-  .row:hover .actions, .row.current .actions { opacity: 1; }
-  .actions button {
-    background: none;
-    border: none;
-    color: var(--ls-color-fg-muted, #64748b);
-    cursor: pointer;
-    padding: 3px 6px;
-    font-size: 11px;
-    border-radius: 3px;
-  }
-  .actions button:hover { color: var(--ls-color-fg, #e0e0e0); background: rgba(255,255,255,0.08); }
-  .add-btn {
-    margin: 6px 12px 10px;
-    padding: 8px 10px;
+  .current-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
     background: var(--ls-color-accent, #7c6af7);
-    color: white;
-    border: none;
-    border-radius: 5px;
-    font-size: 13px;
-    font-family: inherit;
+    flex-shrink: 0;
+  }
+  .footer {
+    border-top: 1px solid var(--ls-color-border, #2a2a3e);
+    padding: 6px 8px;
+    flex-shrink: 0;
+  }
+  .footer button {
+    width: 100%;
+    background: none;
+    border: 1px dashed var(--ls-color-border, #2a2a3e);
+    border-radius: 4px;
+    color: var(--ls-color-fg-muted, #64748b);
+    padding: 6px 10px;
+    font: inherit;
+    font-size: 12px;
     cursor: pointer;
   }
-  .add-btn:hover { opacity: 0.9; }
-  .current-badge {
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    color: var(--ls-color-accent, #7c6af7);
-    flex-shrink: 0;
+  .footer button:hover {
+    color: var(--ls-color-fg, #e0e0e0);
+    background: rgba(255,255,255,0.05);
+    border-color: var(--ls-color-fg-muted, #64748b);
   }
 `;
 
@@ -100,6 +94,7 @@ export class LSVaults extends HTMLElement {
   #shadow: ShadowRoot;
   #vaults: VaultRecord[] = [];
   #currentId: string | null = null;
+  #selectedId: string | null = null;
 
   constructor() {
     super();
@@ -117,9 +112,13 @@ export class LSVaults extends HTMLElement {
   get currentId(): string | null { return this.#currentId; }
   set currentId(v: string | null) { this.#currentId = v; this.#render(); }
 
+  /** UI selection (not "current vault"). Drives which row is highlighted
+   *  and which vault the main pane's detail card shows. */
+  get selectedId(): string | null { return this.#selectedId; }
+  set selectedId(v: string | null) { this.#selectedId = v; this.#render(); }
+
   #render(): void {
     const root = this.#shadow;
-    // Remove previous contents (keep style element).
     for (const child of [...root.children]) {
       if (child.tagName !== "STYLE") child.remove();
     }
@@ -135,34 +134,38 @@ export class LSVaults extends HTMLElement {
     if (this.#vaults.length === 0) {
       const hint = document.createElement("div");
       hint.className = "empty-hint";
-      hint.textContent = "No vaults yet. Add one below.";
+      hint.textContent = "No vaults yet.";
       list.appendChild(hint);
     } else {
-      for (const v of this.#vaults) {
-        list.appendChild(this.#row(v));
-      }
+      for (const v of this.#vaults) list.appendChild(this.#row(v));
     }
 
     root.appendChild(list);
 
-    const add = document.createElement("button");
-    add.className = "add-btn";
-    add.textContent = "+ Add vault";
-    add.addEventListener("click", () => {
-      this.dispatchEvent(new CustomEvent("vault-add", { bubbles: true, composed: true }));
-    });
-    root.appendChild(add);
+    // Footer: + Add vault action. Hidden when there are no vaults because
+    // the main pane's empty state already offers a prominent CTA.
+    if (this.#vaults.length > 0) {
+      const footer = document.createElement("div");
+      footer.className = "footer";
+      const add = document.createElement("button");
+      add.textContent = "+ Add vault";
+      add.addEventListener("click", () => {
+        this.dispatchEvent(new CustomEvent("vault-add", { bubbles: true, composed: true }));
+      });
+      footer.appendChild(add);
+      root.appendChild(footer);
+    }
   }
 
   #row(v: VaultRecord): HTMLElement {
     const row = document.createElement("div");
-    row.className = "row" + (v.id === this.#currentId ? " current" : "");
+    row.className = "row" + (v.id === this.#selectedId ? " selected" : "");
     row.addEventListener("click", () => {
-      this.dispatchEvent(
-        new CustomEvent("vault-switch", {
-          bubbles: true, composed: true, detail: { vaultId: v.id },
-        }),
-      );
+      this.#selectedId = v.id;
+      this.#render();
+      this.dispatchEvent(new CustomEvent("vault-select", {
+        bubbles: true, composed: true, detail: { vaultId: v.id },
+      }));
     });
 
     const labelWrap = document.createElement("div");
@@ -177,49 +180,12 @@ export class LSVaults extends HTMLElement {
     row.appendChild(labelWrap);
 
     if (v.id === this.#currentId) {
-      const badge = document.createElement("span");
-      badge.className = "current-badge";
-      badge.textContent = "Current";
-      row.appendChild(badge);
+      const dot = document.createElement("span");
+      dot.className = "current-dot";
+      dot.title = "Current vault";
+      row.appendChild(dot);
     }
 
-    const actions = document.createElement("div");
-    actions.className = "actions";
-
-    const rename = document.createElement("button");
-    rename.title = "Rename";
-    rename.textContent = "Rename";
-    rename.addEventListener("click", (e) => {
-      e.stopPropagation();
-      const next = prompt(`Rename "${v.label}" to:`, v.label);
-      if (next === null) return;
-      const trimmed = next.trim();
-      if (!trimmed || trimmed === v.label) return;
-      this.dispatchEvent(
-        new CustomEvent("vault-rename", {
-          bubbles: true, composed: true, detail: { vaultId: v.id, label: trimmed },
-        }),
-      );
-    });
-
-    const remove = document.createElement("button");
-    remove.title = "Remove";
-    remove.textContent = "Remove";
-    remove.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (!confirm(
-        `Remove vault "${v.label}" (${v.repoFullName})?\n\n` +
-        `Its local cache and auth will be deleted. The remote GitHub repo is unchanged.`,
-      )) return;
-      this.dispatchEvent(
-        new CustomEvent("vault-remove", {
-          bubbles: true, composed: true, detail: { vaultId: v.id },
-        }),
-      );
-    });
-
-    actions.append(rename, remove);
-    row.appendChild(actions);
     return row;
   }
 }

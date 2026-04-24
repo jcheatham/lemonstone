@@ -29,6 +29,12 @@ import "./ls-history.ts";
 import type { LSHistory, CommitSummary } from "./ls-history.ts";
 import "./ls-vaults.ts";
 import type { LSVaults } from "./ls-vaults.ts";
+import "./ls-vault-detail.ts";
+import type { LSVaultDetail, VaultDetailSnapshot } from "./ls-vault-detail.ts";
+import "./ls-share-create-modal.ts";
+import type { LSShareCreateModal } from "./ls-share-create-modal.ts";
+import "./ls-share-accept-modal.ts";
+import type { LSShareAcceptModal } from "./ls-share-accept-modal.ts";
 import "./ls-unlock-modal.ts";
 import type { LSUnlockModal } from "./ls-unlock-modal.ts";
 import "./ls-enable-encryption-modal.ts";
@@ -388,6 +394,11 @@ export class LSApp extends HTMLElement {
   #activeCommitOid = "";
   #commandsPanel!: HTMLElement;
   #vaults!: LSVaults;
+  #vaultDetail!: LSVaultDetail;
+  #shareCreateModal!: LSShareCreateModal;
+  #shareAcceptModal!: LSShareAcceptModal;
+  /** UI selection in the Vaults subnav. Independent of the active vault. */
+  #selectedVaultId: string | null = null;
   #authModal!: LSModal;
   #unlockModal!: LSUnlockModal;
   #encryptFolderModal!: LSEncryptFolderModal;
@@ -573,23 +584,17 @@ export class LSApp extends HTMLElement {
     this.#commandsPanel.className = "panel-content";
     this.#commandsPanel.dataset["category"] = "commands";
 
-    // Vaults panel: list + switch/add/remove/rename.
+    // Vaults subnav: plain list only. Selecting a row updates the main-pane
+    // detail card (see #vaultDetail wiring below).
     const vaultsPanel = document.createElement("div");
     vaultsPanel.className = "panel-content";
     vaultsPanel.dataset["category"] = "vaults";
     this.#vaults = document.createElement("ls-vaults") as LSVaults;
     this.#vaults.style.cssText = "flex:1;min-height:0;";
-    this.#vaults.addEventListener("vault-switch", (e) => {
+    this.#vaults.addEventListener("vault-select", (e) => {
       const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
-      navigateToVault(vaultId);
-    });
-    this.#vaults.addEventListener("vault-remove", (e) => {
-      const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
-      this.#handleVaultRemove(vaultId).catch(console.error);
-    });
-    this.#vaults.addEventListener("vault-rename", (e) => {
-      const { vaultId, label } = (e as CustomEvent<{ vaultId: string; label: string }>).detail;
-      multiplexer.renameVault(vaultId, label).catch(console.error);
+      this.#selectedVaultId = vaultId;
+      this.#refreshVaultDetail();
     });
     this.#vaults.addEventListener("vault-add", () => {
       this.#showAuthOverlay();
@@ -625,6 +630,33 @@ export class LSApp extends HTMLElement {
     this.#editorWrap = document.createElement("div");
     this.#editorWrap.id = "editor-wrap";
     main.appendChild(this.#editorWrap);
+
+    // Vault detail pane — occupies the main area when the Vaults category
+    // is active, otherwise hidden so the editor takes the space.
+    this.#vaultDetail = document.createElement("ls-vault-detail") as LSVaultDetail;
+    this.#vaultDetail.style.cssText = "flex:1;min-height:0;display:none;";
+    this.#vaultDetail.addEventListener("vault-switch", (e) => {
+      const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
+      navigateToVault(vaultId);
+      // Snap out of Vaults into Files so the user sees their content.
+      this.#drillInto("files");
+    });
+    this.#vaultDetail.addEventListener("vault-rename", (e) => {
+      const { vaultId, label } = (e as CustomEvent<{ vaultId: string; label: string }>).detail;
+      multiplexer.renameVault(vaultId, label).catch(console.error);
+    });
+    this.#vaultDetail.addEventListener("vault-remove", (e) => {
+      const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
+      this.#handleVaultRemove(vaultId).catch(console.error);
+    });
+    this.#vaultDetail.addEventListener("vault-share", (e) => {
+      const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
+      this.#openShareCreate(vaultId);
+    });
+    this.#vaultDetail.addEventListener("vault-add", () => {
+      this.#showAuthOverlay();
+    });
+    main.appendChild(this.#vaultDetail);
 
     // Show welcome screen initially
     this.#showWelcome();
@@ -685,6 +717,15 @@ export class LSApp extends HTMLElement {
       this.hideAuthOverlay();
       this.#postAuthAddVault(detail.tokens).catch(console.error);
     });
+    modal.addEventListener("auth-cancel", () => {
+      this.hideAuthOverlay();
+    });
+    // Backdrop click — dismiss when the user clicks the dimmed area around
+    // the modal (not the modal itself). The overlay is light DOM so a simple
+    // target check suffices (no shadow retargeting here).
+    this.#authOverlay.addEventListener("click", (e) => {
+      if (e.target === this.#authOverlay) this.hideAuthOverlay();
+    });
     this.#authOverlay.appendChild(modal);
     this.#authModal = modal;
 
@@ -708,6 +749,17 @@ export class LSApp extends HTMLElement {
     this.#encryptFolderModal.addEventListener("zone-create", (e) => {
       const { prefix, passphrase } = (e as CustomEvent<{ prefix: string; passphrase: string }>).detail;
       this.#handleCreateZone(prefix, passphrase).catch(console.error);
+    });
+
+    // Share-link modals.
+    this.#shareCreateModal = document.createElement("ls-share-create-modal") as LSShareCreateModal;
+    this.#shareAcceptModal = document.createElement("ls-share-accept-modal") as LSShareAcceptModal;
+    this.#shareAcceptModal.addEventListener("share-accept", (e) => {
+      const { payload } = (e as CustomEvent<{ payload: { accessToken: string; repoFullName: string; repoDefaultBranch: string } }>).detail;
+      this.#handleShareAccept(payload).catch(console.error);
+    });
+    this.#shareAcceptModal.addEventListener("share-accept-cancel", () => {
+      navigateToVaults();
     });
 
     // Palette + switcher (appended to shadow root, not inside a flex child)
@@ -736,6 +788,8 @@ export class LSApp extends HTMLElement {
       this.#authOverlay,
       this.#unlockModal,
       this.#encryptFolderModal,
+      this.#shareCreateModal,
+      this.#shareAcceptModal,
       this.#palette,
       this.#switcher
     );
@@ -776,6 +830,16 @@ export class LSApp extends HTMLElement {
     this.#categoryNav.mode = "rail";
     this.#showPanel(id);
     this.#categoryPanel.classList.remove("dimmed");
+    // Vaults category hijacks the main pane to show a detail card. Every
+    // other category leaves the editor in place.
+    if (id === "vaults") {
+      this.#editorWrap.style.display = "none";
+      this.#vaultDetail.style.display = "flex";
+      this.#refreshVaultDetail().catch(console.error);
+    } else {
+      this.#vaultDetail.style.display = "none";
+      this.#editorWrap.style.display = "";
+    }
     // Category-specific activation that used to live in the preview handler:
     if (id === "search") requestAnimationFrame(() => this.#search.focus());
     if (id === "history") this.#loadHistory().catch(console.error);
@@ -1283,6 +1347,17 @@ export class LSApp extends HTMLElement {
     // main.ts has already awaited multiplexer.boot() and attempted to open
     // the last-used vault. Here we catch up on the UI side.
     await this.#refreshVaultsList();
+
+    // If the user arrived via a share link, honor it regardless of whether
+    // they already have vaults. Doing this BEFORE the empty-state navigate
+    // below is critical — otherwise navigateToVaults() would wipe the hash
+    // before handleRoute could ever see the share blob.
+    const route = currentRoute();
+    if (route.type === "share") {
+      await this.#handleRoute(route);
+      return;
+    }
+
     const vaults = await multiplexer.listVaults();
     if (vaults.length === 0) {
       // Empty state — first-run. Show the auth overlay which will produce a
@@ -1352,6 +1427,55 @@ export class LSApp extends HTMLElement {
     if (!headOid || headOid === this.#currentSha) return;
     this.#currentSha = headOid;
     this.#renderRepoLabel();
+  }
+
+  /** Called after a shared-link accept modal yields a decrypted payload.
+   *  If the user already has a vault for this repo, switches to it instead
+   *  of adding a duplicate; otherwise creates a new vault from the shared
+   *  credentials. */
+  async #handleShareAccept(payload: {
+    accessToken: string;
+    repoFullName: string;
+    repoDefaultBranch: string;
+  }): Promise<void> {
+    this.#shareAcceptModal.setBusy(true);
+    try {
+      const existing = (await multiplexer.listVaults())
+        .find((v) => v.repoFullName === payload.repoFullName);
+      if (existing) {
+        this.#shareAcceptModal.hide();
+        navigateToVault(existing.id);
+        getToast().show(
+          `You already have "${existing.label}" — opening it instead of adding a duplicate.`,
+          "info",
+          6000,
+        );
+        return;
+      }
+      const tokens: AuthPayload = {
+        accessToken: payload.accessToken,
+        refreshToken: "",
+        accessTokenExpiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000,
+        refreshTokenExpiresAt: 0,
+        installationId: 0,
+        repoFullName: payload.repoFullName,
+        repoDefaultBranch: payload.repoDefaultBranch,
+      };
+      const record = await multiplexer.addVault(tokens);
+      this.#shareAcceptModal.hide();
+      navigateToVault(record.id);
+      await multiplexer.open(record.id);
+      this.#setRepoLabel(record.repoFullName);
+      vaultService.sync().catch(console.error);
+      this.#setStatus("ok", "Ready");
+      await this.#loadNoteList();
+      getToast().show(`Added shared vault "${record.label}".`, "success", 5000);
+    } catch (err) {
+      console.error("[share] accept failed:", err);
+      this.#shareAcceptModal.setError(`Could not add vault: ${(err as Error).message}`);
+    } finally {
+      this.#shareAcceptModal.setBusy(false);
+    }
   }
 
   /** Called after the auth modal produces a new (vaultless) set of tokens.
@@ -1450,7 +1574,10 @@ export class LSApp extends HTMLElement {
     });
 
     for (const ev of ["vault:zoneCreated", "vault:zoneRemoved", "vault:zoneUnlocked", "vault:zoneLocked", "vault:allZonesLocked", "vault:zonesReloaded"]) {
-      vaultService.addEventListener(ev, () => this.#refreshZoneBadges());
+      vaultService.addEventListener(ev, () => {
+        this.#refreshZoneBadges();
+        this.#refreshVaultDetail().catch(console.error);
+      });
     }
     // When a zone locks, an actively-open file inside that zone should be
     // evicted: the editor is still showing plaintext in memory, and edits
@@ -1575,6 +1702,45 @@ export class LSApp extends HTMLElement {
     const vaults = await multiplexer.listVaults();
     this.#vaults.vaults = vaults;
     this.#vaults.currentId = multiplexer.currentVaultId;
+    // Auto-select: prefer the current vault, else the first in the list.
+    if (!this.#selectedVaultId || !vaults.some((v) => v.id === this.#selectedVaultId)) {
+      this.#selectedVaultId = multiplexer.currentVaultId ?? vaults[0]?.id ?? null;
+    }
+    this.#vaults.selectedId = this.#selectedVaultId;
+    await this.#refreshVaultDetail();
+  }
+
+  /** Rebuild the main-pane detail card from the currently-selected vault. */
+  async #refreshVaultDetail(): Promise<void> {
+    if (!this.#vaultDetail) return;
+    const vaults = await multiplexer.listVaults();
+    if (vaults.length === 0) {
+      this.#vaultDetail.setSnapshot(null);
+      return;
+    }
+    const id = this.#selectedVaultId ?? multiplexer.currentVaultId ?? vaults[0]!.id;
+    const record = vaults.find((v) => v.id === id) ?? vaults[0]!;
+    const isCurrent = multiplexer.currentVaultId === record.id;
+    const current = multiplexer.currentVault;
+    const snapshot: VaultDetailSnapshot = {
+      record,
+      isCurrent,
+      // lastSyncAt + zone stats only available for the active vault in memory.
+      lastSyncAt: isCurrent && current ? current.lastSyncAt : null,
+      zoneCount: isCurrent && current ? current.listZones().length : 0,
+      lockedZoneCount: isCurrent && current
+        ? current.listZones().filter((z) => !current.isZoneUnlocked(z.id)).length
+        : 0,
+    };
+    this.#vaultDetail.setSnapshot(snapshot);
+  }
+
+  async #openShareCreate(vaultId: string): Promise<void> {
+    const vaults = await multiplexer.listVaults();
+    const vault = vaults.find((v) => v.id === vaultId);
+    if (!vault) return;
+    this.#shareCreateModal.setVault(vault);
+    this.#shareCreateModal.show();
   }
 
   async #handleVaultRemove(vaultId: string): Promise<void> {
@@ -1632,6 +1798,11 @@ export class LSApp extends HTMLElement {
   };
 
   async #handleRoute(route: Route): Promise<void> {
+    if (route.type === "share") {
+      this.#shareAcceptModal.setBlob(route.blob);
+      this.#shareAcceptModal.show();
+      return;
+    }
     if (route.type === "vaults") {
       this.#activePath = "";
       this.#showWelcome();
@@ -1639,6 +1810,8 @@ export class LSApp extends HTMLElement {
       this.#outline.headings = [];
       this.#backlinks.links = [];
       this.#conflictBanner.classList.remove("visible");
+      // Default selection = current vault (if any).
+      if (!this.#selectedVaultId) this.#selectedVaultId = multiplexer.currentVaultId;
       this.#drillInto("vaults");
       return;
     }

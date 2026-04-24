@@ -12,7 +12,8 @@ export type Route =
   | { type: "home" }
   | { type: "vaults" }
   | { type: "vault"; vaultId: string }
-  | { type: "note"; vaultId: string; path: string };
+  | { type: "note"; vaultId: string; path: string }
+  | { type: "share"; blob: string };
 
 export function currentRoute(): Route {
   return parseHash(location.hash);
@@ -31,6 +32,12 @@ export function navigateToVault(vaultId: string): void {
 /** Navigate to the top-level Vaults list. */
 export function navigateToVaults(): void {
   location.hash = "/vaults";
+}
+
+/** Navigate to a share-link route. Mostly useful for testing — recipients
+ *  arrive at this route organically from a link outside the app. */
+export function navigateToShare(blob: string): void {
+  location.hash = `/share/${encodeURIComponent(blob)}`;
 }
 
 // Router-side view of "current vault." Populated by the multiplexer on
@@ -69,6 +76,11 @@ function parseHash(hash: string): Route {
   const clean = hash.replace(/^#\/?/, "");
   if (clean === "" || clean === "/") return { type: "home" };
   if (clean === "vaults") return { type: "vaults" };
+  if (clean.startsWith("share/")) {
+    const encoded = clean.slice("share/".length);
+    try { return { type: "share", blob: decodeURIComponent(encoded) }; }
+    catch { return { type: "vaults" }; }
+  }
   if (clean.startsWith("v/")) {
     const rest = clean.slice(2);
     const slash = rest.indexOf("/");

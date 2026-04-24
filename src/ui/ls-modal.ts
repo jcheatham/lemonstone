@@ -6,6 +6,8 @@
 // Events (bubbles, composed):
 //   auth-complete — detail: { tokens: AuthPayload } — caller persists and
 //                   registers the vault (multi-vault aware).
+//   auth-cancel   — user backed out of the flow (Cancel button or Escape).
+//                   Caller hides the overlay. No payload.
 
 import { validatePAT, fetchRepo, buildPATAuthPayload } from "../auth/index.ts";
 import type { GitHubUser } from "../auth/index.ts";
@@ -94,6 +96,15 @@ export class LSModal extends HTMLElement {
     sheet.textContent = style;
     this.#shadow.appendChild(sheet);
     this.#renderStep1();
+    // Escape dismisses at any step — consistent with the share modals.
+    this.#shadow.addEventListener("keydown", (e) => {
+      const ke = e as KeyboardEvent;
+      if (ke.key === "Escape") { ke.preventDefault(); this.#cancel(); }
+    });
+  }
+
+  #cancel(): void {
+    this.dispatchEvent(new CustomEvent("auth-cancel", { bubbles: true, composed: true }));
   }
 
   /** Reset the modal back to its initial empty state so it's ready for the
@@ -148,10 +159,15 @@ export class LSModal extends HTMLElement {
     btn.className = "btn";
     btn.textContent = "Verify token";
 
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "btn btn-secondary";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => this.#cancel());
+
     const status = document.createElement("div");
     status.className = "status";
 
-    step.append(btn, status);
+    step.append(btn, cancelBtn, status);
     this.#shadow.appendChild(step);
 
     const go = async (): Promise<void> => {
@@ -228,11 +244,15 @@ export class LSModal extends HTMLElement {
     const backBtn = document.createElement("button");
     backBtn.className = "btn btn-secondary";
     backBtn.textContent = "← Back";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "btn btn-secondary";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => this.#cancel());
 
     const status = document.createElement("div");
     status.className = "status";
 
-    step.append(connectBtn, backBtn, status);
+    step.append(connectBtn, backBtn, cancelBtn, status);
     this.#shadow.appendChild(step);
 
     requestAnimationFrame(() => {

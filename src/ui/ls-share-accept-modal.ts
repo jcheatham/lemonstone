@@ -1,14 +1,9 @@
-// <ls-unlock-modal> — passphrase entry to unlock an encrypted zone.
-//
-// Shown lazily: the first time the user tries to read/write a file that
-// falls inside a locked zone, the app intercepts the resulting
-// ZoneLockedError, sets the zone prefix on this modal, and shows it.
-//
-// Events (bubbles, composed):
-//   vault-unlock        — detail: { passphrase, zoneId } — submit
-//   vault-unlock-cancel — detail: { zoneId } — user dismissed without unlocking
-//
-// Dismissable via Cancel button, Escape key, or clicking the backdrop.
+// <ls-share-accept-modal> — receives a shared vault link and asks the user
+// for the password that decrypts it. On successful decrypt fires
+// `share-accept` with detail { payload } so the caller can register a new
+// vault from the decrypted tokens.
+
+import { decodeShareLink, type ShareLinkPayload } from "../vault/share-link.ts";
 
 const style = `
   :host {
@@ -22,26 +17,16 @@ const style = `
     font-family: var(--ls-font-ui, system-ui, sans-serif);
   }
   :host(.visible) { display: flex; }
-
   .panel {
     background: var(--ls-color-bg-overlay, #1e1e2e);
     border: 1px solid var(--ls-color-border, #333);
     border-radius: 8px;
     padding: 24px;
-    width: min(420px, 90vw);
+    width: min(440px, 92vw);
     box-shadow: 0 24px 48px rgba(0,0,0,0.55);
   }
-  h2 {
-    margin: 0 0 8px;
-    font-size: 17px;
-    color: var(--ls-color-fg, #e0e0e0);
-  }
-  p {
-    margin: 0 0 16px;
-    color: var(--ls-color-fg-muted, #64748b);
-    font-size: 13px;
-    line-height: 1.5;
-  }
+  h2 { margin: 0 0 8px; font-size: 17px; color: var(--ls-color-fg, #e0e0e0); }
+  p { margin: 0 0 14px; color: var(--ls-color-fg-muted, #64748b); font-size: 13px; line-height: 1.5; }
   input[type="password"] {
     width: 100%;
     box-sizing: border-box;
@@ -56,19 +41,9 @@ const style = `
     caret-color: var(--ls-color-accent, #7c6af7);
   }
   input[type="password"]:focus { border-color: var(--ls-color-accent, #7c6af7); }
-  .error {
-    margin-top: 8px;
-    color: #f87171;
-    font-size: 12px;
-    display: none;
-  }
+  .error { margin-top: 8px; color: #f87171; font-size: 12px; display: none; }
   .error.visible { display: block; }
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 16px;
-  }
+  .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
   button {
     background: var(--ls-color-accent, #7c6af7);
     color: white;
@@ -79,10 +54,7 @@ const style = `
     font-size: 13px;
     cursor: pointer;
   }
-  button:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
+  button:disabled { opacity: 0.5; cursor: default; }
   button.secondary {
     background: rgba(255,255,255,0.06);
     color: var(--ls-color-fg, #e0e0e0);
@@ -90,14 +62,13 @@ const style = `
   }
 `;
 
-export class LSUnlockModal extends HTMLElement {
+export class LSShareAcceptModal extends HTMLElement {
   #shadow: ShadowRoot;
-  #title!: HTMLElement;
   #input!: HTMLInputElement;
   #error!: HTMLElement;
   #submit!: HTMLButtonElement;
   #cancel!: HTMLButtonElement;
-  #zoneId: string | null = null;
+  #blob = "";
 
   constructor() {
     super();
@@ -107,15 +78,11 @@ export class LSUnlockModal extends HTMLElement {
     this.#shadow.appendChild(sheet);
     this.#buildDOM();
 
-    // Backdrop click (click on the host itself, not the panel) dismisses.
-    // Shadow DOM retargets e.target to the host for listeners outside the
-    // shadow, so checking `e.target === this` would match clicks on the
-    // input/buttons too. composedPath()[0] gives the true innermost target.
     this.addEventListener("click", (e) => {
+      // Shadow DOM retargets e.target to the host; use composedPath to see
+      // the real innermost target so clicks on inputs/buttons don't dismiss.
       if (e.composedPath()[0] === this) this.#dismiss();
     });
-    // Escape closes from anywhere inside the modal — including when focus
-    // is on the password input.
     this.#shadow.addEventListener("keydown", (e) => {
       const ke = e as KeyboardEvent;
       if (ke.key === "Escape") { ke.preventDefault(); this.#dismiss(); }
@@ -126,20 +93,21 @@ export class LSUnlockModal extends HTMLElement {
     const panel = document.createElement("div");
     panel.className = "panel";
 
-    this.#title = document.createElement("h2");
-    this.#title.textContent = "Unlock folder";
+    const title = document.createElement("h2");
+    title.textContent = "Vault shared with you";
 
     const info = document.createElement("p");
     info.textContent =
-      "Enter the passphrase for this folder. The passphrase is never sent " +
-      "anywhere — decryption happens locally.";
+      "Someone shared an encrypted link to one of their vaults. Enter the " +
+      "password they gave you to unlock it and add it to your vaults. The " +
+      "password is only used locally — it isn't sent anywhere.";
 
     this.#input = document.createElement("input");
     this.#input.type = "password";
-    this.#input.placeholder = "Passphrase";
-    this.#input.autocomplete = "current-password";
+    this.#input.placeholder = "Password";
+    this.#input.autocomplete = "off";
     this.#input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") this.#submitPassphrase();
+      if (e.key === "Enter") this.#attemptDecode();
     });
 
     this.#error = document.createElement("div");
@@ -155,19 +123,14 @@ export class LSUnlockModal extends HTMLElement {
 
     this.#submit = document.createElement("button");
     this.#submit.textContent = "Unlock";
-    this.#submit.addEventListener("click", () => this.#submitPassphrase());
+    this.#submit.addEventListener("click", () => this.#attemptDecode());
 
     actions.append(this.#cancel, this.#submit);
-
-    panel.append(this.#title, info, this.#input, this.#error, actions);
+    panel.append(title, info, this.#input, this.#error, actions);
     this.#shadow.appendChild(panel);
   }
 
-  /** Identify the zone this modal is unlocking. Sets the title to include the folder prefix. */
-  setZone(zoneId: string, prefix: string): void {
-    this.#zoneId = zoneId;
-    this.#title.textContent = `Unlock ${prefix}`;
-  }
+  setBlob(blob: string): void { this.#blob = blob; }
 
   show(): void {
     this.classList.add("visible");
@@ -175,18 +138,18 @@ export class LSUnlockModal extends HTMLElement {
     this.#input.disabled = false;
     this.#error.classList.remove("visible");
     this.#submit.disabled = false;
+    this.#cancel.disabled = false;
     requestAnimationFrame(() => this.#input.focus());
   }
 
-  hide(): void {
-    this.classList.remove("visible");
-  }
+  hide(): void { this.classList.remove("visible"); }
 
   setError(message: string): void {
     this.#error.textContent = message;
     this.#error.classList.add("visible");
-    this.#input.select();
     this.#submit.disabled = false;
+    this.#cancel.disabled = false;
+    this.#input.select();
   }
 
   setBusy(busy: boolean): void {
@@ -196,31 +159,34 @@ export class LSUnlockModal extends HTMLElement {
     this.#input.disabled = busy;
   }
 
-  #submitPassphrase(): void {
-    const passphrase = this.#input.value;
-    if (!passphrase) return;
-    if (!this.#zoneId) {
-      this.setError("No zone selected. Close and retry.");
-      return;
-    }
+  async #attemptDecode(): Promise<void> {
+    const password = this.#input.value;
+    if (!password) return;
+    if (!this.#blob) { this.setError("No share link data present."); return; }
     this.#error.classList.remove("visible");
-    this.dispatchEvent(new CustomEvent("vault-unlock", {
-      bubbles: true,
-      composed: true,
-      detail: { passphrase, zoneId: this.#zoneId },
-    }));
+    this.setBusy(true);
+    try {
+      const payload = await decodeShareLink(this.#blob, password);
+      this.dispatchEvent(new CustomEvent("share-accept", {
+        bubbles: true,
+        composed: true,
+        detail: { payload } as { payload: ShareLinkPayload },
+      }));
+    } catch (err) {
+      const msg = (err as Error).message === "wrong password"
+        ? "Wrong password — try again."
+        : `Could not open this link: ${(err as Error).message}`;
+      this.setError(msg);
+    } finally {
+      this.setBusy(false);
+    }
   }
 
   #dismiss(): void {
-    if (this.#submit.disabled) return; // mid-unlock; wait for it to finish
-    const zoneId = this.#zoneId;
+    if (this.#submit.disabled) return; // mid-decrypt
     this.hide();
-    this.dispatchEvent(new CustomEvent("vault-unlock-cancel", {
-      bubbles: true,
-      composed: true,
-      detail: { zoneId },
-    }));
+    this.dispatchEvent(new CustomEvent("share-accept-cancel", { bubbles: true, composed: true }));
   }
 }
 
-customElements.define("ls-unlock-modal", LSUnlockModal);
+customElements.define("ls-share-accept-modal", LSShareAcceptModal);
