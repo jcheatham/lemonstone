@@ -478,6 +478,18 @@ export class LSCanvas extends HTMLElement {
   #zoom = 1;
   #hasFit = false;
 
+  /** All currently-active touch pointers (pointerType === "touch"), indexed
+   *  by pointerId. Drives pinch-zoom detection and handling on mobile. */
+  #touchPointers = new Map<number, { x: number; y: number }>();
+  /** When true, an ongoing pinch gesture has ownership of pointer events;
+   *  the single-finger pan logic steps aside. */
+  #pinchActive = false;
+  /** Abort callback for the current pointer-driven gesture (pan, node drag,
+   *  resize, edge-create, endpoint drag). Pinch calls this when a second
+   *  finger joins so a node drag in progress can't fight pinch over the
+   *  same pointer stream. */
+  #activeGestureCleanup: (() => void) | null = null;
+
   /** Node-ID → rendered HTMLElement, for incremental render. */
   #nodeEls = new Map<string, HTMLElement>();
   #selected = new Set<string>();
@@ -542,6 +554,15 @@ export class LSCanvas extends HTMLElement {
     this.addEventListener("wheel", this.#onWheel, { passive: false });
     this.addEventListener("dblclick", this.#onDblClick);
     this.addEventListener("keydown", this.#onKeyDown);
+    // Permanent cleanup for the touch-pointer map. Gesture-specific handlers
+    // (pan's onUp, pinch's onEnd) also remove entries, but if a pinch ends
+    // with one finger still down, no gesture tracks the remaining pointer —
+    // and when it eventually lifts, nothing cleans up its entry. That
+    // leaves a stale "ghost" finger that future pinch checks count as an
+    // active second touch, producing spurious zoom reactions during what
+    // should be single-finger pans.
+    this.addEventListener("pointerup", this.#onGlobalPointerEnd);
+    this.addEventListener("pointercancel", this.#onGlobalPointerEnd);
     this.#render();
     this.#updateHud();
     this.#updateEmptyState();
@@ -551,6 +572,8 @@ export class LSCanvas extends HTMLElement {
     this.removeEventListener("pointerdown", this.#onPointerDown);
     this.removeEventListener("wheel", this.#onWheel);
     this.removeEventListener("dblclick", this.#onDblClick);
+    this.removeEventListener("pointerup", this.#onGlobalPointerEnd);
+    this.removeEventListener("pointercancel", this.#onGlobalPointerEnd);
     this.removeEventListener("keydown", this.#onKeyDown);
   }
 
@@ -695,6 +718,21 @@ export class LSCanvas extends HTMLElement {
   // ── Pointer: pan on empty, drag on node ──────────────────────────────────
 
   #onPointerDown = (e: PointerEvent): void => {
+    // Track every touch so multi-touch gestures (pinch-zoom) work even if
+    // one of the fingers landed on a node. Mouse/pen go through the normal
+    // single-pointer path.
+    if (e.pointerType === "touch") {
+      this.#touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (this.#touchPointers.size >= 2) {
+        // A second finger just joined — switch to pinch mode. Abort any
+        // single-finger gesture (pan, node drag, resize, …) already in
+        // progress so it doesn't fight pinch over the same pointer stream.
+        this.#abortActiveGesture();
+        if (!this.#pinchActive) this.#startPinch();
+        return;
+      }
+    }
+
     if (e.button !== 0 && e.button !== 1) return;
     const inner = e.composedPath()[0] as Element | null;
 
@@ -714,6 +752,103 @@ export class LSCanvas extends HTMLElement {
     this.#startPan(e);
   };
 
+  /** Two-finger pinch handler.
+   *
+   *  Baselines the canvas pan/zoom + finger positions at gesture start and
+   *  computes every subsequent frame directly from the current finger
+   *  positions relative to that baseline. Earlier versions did frame-to-
+   *  frame incremental math, which accumulated rounding and anchor-shift
+   *  errors — those showed up as visible 5-10% zoom jumps.
+   *
+   *  The invariant we maintain: the canvas-space point that was under the
+   *  initial midpoint stays under the current midpoint. That point is
+   *  computed once (initial) and reused every frame, so there's nothing
+   *  to drift. */
+  #startPinch(): void {
+    this.#pinchActive = true;
+    this.classList.add("panning");
+
+    const pts = () => [...this.#touchPointers.values()] as { x: number; y: number }[];
+    const MIN_PAIR_DIST = 10;
+
+    let initialDist: number;
+    // Anchor in CANVAS coordinates — the point under the user's initial
+    // midpoint. This is the invariant: the same canvas point should stay
+    // under the current midpoint for the duration of the gesture. Once
+    // captured at snapshot time, it never changes — no drift.
+    let anchorCanvasX: number;
+    let anchorCanvasY: number;
+    let initialZoom: number;
+
+    const snapshot = (): void => {
+      const [a, b] = pts();
+      initialDist = Math.hypot(a!.x - b!.x, a!.y - b!.y);
+      const initialMidX = (a!.x + b!.x) / 2;
+      const initialMidY = (a!.y + b!.y) / 2;
+      initialZoom = this.#zoom;
+      // Read rect AT snapshot time to resolve initialMid into canvas coords.
+      const rect = this.getBoundingClientRect();
+      anchorCanvasX = (initialMidX - rect.left - this.#panX) / this.#zoom;
+      anchorCanvasY = (initialMidY - rect.top - this.#panY) / this.#zoom;
+    };
+    snapshot();
+
+    const onMove = (ev: PointerEvent): void => {
+      if (!this.#touchPointers.has(ev.pointerId)) return;
+      this.#touchPointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      if (this.#touchPointers.size !== 2) return;
+      const [a, b] = pts();
+      const dist = Math.hypot(a!.x - b!.x, a!.y - b!.y);
+      if (dist < MIN_PAIR_DIST || initialDist < MIN_PAIR_DIST) {
+        // Fingers too close to measure a reliable zoom factor — re-baseline
+        // silently until they're apart enough.
+        snapshot();
+        return;
+      }
+      const midX = (a!.x + b!.x) / 2;
+      const midY = (a!.y + b!.y) / 2;
+
+      // Absolute zoom derived from initial state — not frame-to-frame.
+      const newZoom = Math.max(0.1, Math.min(4, initialZoom * (dist / initialDist)));
+
+      // Re-read rect EVERY frame. On mobile the host's client-space position
+      // can shift mid-gesture when the browser hides/shows its toolbar,
+      // the visual viewport jumps, or the keyboard dismisses. Cached rects
+      // cause a visible snap at the end when reality catches up.
+      const rect = this.getBoundingClientRect();
+      const currentHostX = midX - rect.left;
+      const currentHostY = midY - rect.top;
+
+      // Solve for pan that keeps `anchorCanvas` sitting under `currentHost`:
+      //   currentHost = anchorCanvas * newZoom + newPan
+      this.#panX = currentHostX - anchorCanvasX * newZoom;
+      this.#panY = currentHostY - anchorCanvasY * newZoom;
+      this.#zoom = newZoom;
+
+      this.#applyTransform();
+      this.#updateHud();
+    };
+
+    const onEnd = (ev: PointerEvent): void => {
+      this.#touchPointers.delete(ev.pointerId);
+      if (this.#touchPointers.size < 2) {
+        this.#pinchActive = false;
+        this.classList.remove("panning");
+        this.removeEventListener("pointermove", onMove);
+        this.removeEventListener("pointerup", onEnd);
+        this.removeEventListener("pointercancel", onEnd);
+      } else {
+        // Still 2+ fingers (user lifted a third) — re-baseline so the new
+        // pair's positions are the reference for the rest of the gesture.
+        snapshot();
+      }
+    };
+
+    this.addEventListener("pointermove", onMove);
+    this.addEventListener("pointerup", onEnd);
+    this.addEventListener("pointercancel", onEnd);
+  }
+
   #startPan(e: PointerEvent): void {
     e.preventDefault();
     this.focus();
@@ -725,20 +860,45 @@ export class LSCanvas extends HTMLElement {
     try { this.setPointerCapture(e.pointerId); } catch { /* noop */ }
 
     const onMove = (ev: PointerEvent): void => {
+      // If pinch took over, back off — pinch's handler owns panX/panY now.
+      if (this.#pinchActive) return;
       this.#panX = startPanX + (ev.clientX - startX);
       this.#panY = startPanY + (ev.clientY - startY);
       this.#applyTransform();
     };
-    const onUp = (): void => {
+    const cleanup = (): void => {
       this.classList.remove("panning");
       this.removeEventListener("pointermove", onMove);
       this.removeEventListener("pointerup", onUp);
       this.removeEventListener("pointercancel", onUp);
+      if (this.#activeGestureCleanup === cleanup) this.#activeGestureCleanup = null;
     };
+    const onUp = (ev: PointerEvent): void => {
+      if (ev.pointerType === "touch") this.#touchPointers.delete(ev.pointerId);
+      cleanup();
+    };
+    this.#activeGestureCleanup = cleanup;
     this.addEventListener("pointermove", onMove);
     this.addEventListener("pointerup", onUp);
     this.addEventListener("pointercancel", onUp);
   }
+
+  /** Abort whatever pointer gesture currently owns the event stream. Called
+   *  by pinch-start so single-finger drags don't fight pinch for the same
+   *  pointers. Each gesture's cleanup registers itself in
+   *  `#activeGestureCleanup`; this just invokes and clears that. */
+  #abortActiveGesture(): void {
+    const cb = this.#activeGestureCleanup;
+    this.#activeGestureCleanup = null;
+    cb?.();
+  }
+
+  /** Always remove a touch pointer from the tracking map on release, even
+   *  if no active gesture was listening for it. Prevents "ghost finger"
+   *  state after a pinch-then-release where one finger lingered briefly. */
+  #onGlobalPointerEnd = (e: PointerEvent): void => {
+    if (e.pointerType === "touch") this.#touchPointers.delete(e.pointerId);
+  };
 
   #onNodePointerDown(e: PointerEvent, nodeEl: HTMLElement): void {
     const id = nodeEl.dataset["id"]!;
@@ -800,6 +960,9 @@ export class LSCanvas extends HTMLElement {
     try { this.setPointerCapture(e.pointerId); } catch { /* noop */ }
 
     const onMove = (ev: PointerEvent): void => {
+      // Pinch has taken over — stop updating node positions or we'll drag
+      // the node along with the zoom gesture.
+      if (this.#pinchActive) return;
       lastDx = (ev.clientX - startX) / this.#zoom;
       lastDy = (ev.clientY - startY) / this.#zoom;
       if (!dragging && Math.hypot(lastDx, lastDy) < 3) return; // dead zone
@@ -816,12 +979,19 @@ export class LSCanvas extends HTMLElement {
       // Update edges live so they follow the dragged nodes.
       this.#renderEdgesLive(startPositions, lastDx, lastDy);
     };
-    const onUp = (): void => {
+    const cleanup = (): void => {
       this.removeEventListener("pointermove", onMove);
       this.removeEventListener("pointerup", onUp);
       this.removeEventListener("pointercancel", onUp);
       for (const el of this.#nodeEls.values()) el.classList.remove("dragging");
-      if (dragging) {
+      if (this.#activeGestureCleanup === cleanup) this.#activeGestureCleanup = null;
+    };
+    const onUp = (): void => {
+      cleanup();
+      // Commit only if we actually dragged AND pinch didn't hijack. If pinch
+      // took over we roll the node positions back to their starts instead of
+      // saving the half-finished drag.
+      if (dragging && !this.#pinchActive) {
         let doc = this.#doc;
         for (const nid of this.#selected) {
           doc = moveNode(doc, nid, lastDx, lastDy);
@@ -829,8 +999,19 @@ export class LSCanvas extends HTMLElement {
         this.#doc = doc;
         this.#renderEdges(); // final
         this.#emitChange();
+      } else if (dragging) {
+        // Pinch took over mid-drag — revert the nodes to their pre-drag spots
+        // so we don't leave them stranded halfway.
+        for (const [nid, pos] of startPositions) {
+          const el = this.#nodeEls.get(nid);
+          if (!el) continue;
+          el.style.left = `${pos.x}px`;
+          el.style.top = `${pos.y}px`;
+        }
+        this.#renderEdges();
       }
     };
+    this.#activeGestureCleanup = cleanup;
     this.addEventListener("pointermove", onMove);
     this.addEventListener("pointerup", onUp);
     this.addEventListener("pointercancel", onUp);
