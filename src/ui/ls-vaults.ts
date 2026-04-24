@@ -15,6 +15,7 @@ const style = `
   .header {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     padding: 8px 12px 4px;
     font-size: 11px;
     font-weight: 600;
@@ -23,6 +24,18 @@ const style = `
     color: var(--ls-color-fg-muted, #64748b);
     flex-shrink: 0;
   }
+  .header button {
+    background: none;
+    border: none;
+    color: var(--ls-color-fg-muted, #64748b);
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0 2px;
+    border-radius: 3px;
+    font-family: inherit;
+  }
+  .header button:hover { color: var(--ls-color-fg, #e0e0e0); background: rgba(255,255,255,0.07); }
   .list { flex: 1; overflow-y: auto; padding: 4px 0 8px; }
   .empty-hint {
     padding: 16px 12px;
@@ -67,27 +80,6 @@ const style = `
     background: var(--ls-color-accent, #7c6af7);
     flex-shrink: 0;
   }
-  .footer {
-    border-top: 1px solid var(--ls-color-border, #2a2a3e);
-    padding: 6px 8px;
-    flex-shrink: 0;
-  }
-  .footer button {
-    width: 100%;
-    background: none;
-    border: 1px dashed var(--ls-color-border, #2a2a3e);
-    border-radius: 4px;
-    color: var(--ls-color-fg-muted, #64748b);
-    padding: 6px 10px;
-    font: inherit;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .footer button:hover {
-    color: var(--ls-color-fg, #e0e0e0);
-    background: rgba(255,255,255,0.05);
-    border-color: var(--ls-color-fg-muted, #64748b);
-  }
 `;
 
 export class LSVaults extends HTMLElement {
@@ -125,7 +117,15 @@ export class LSVaults extends HTMLElement {
 
     const header = document.createElement("div");
     header.className = "header";
-    header.textContent = "Vaults";
+    const title = document.createElement("span");
+    title.textContent = "Vaults";
+    const add = document.createElement("button");
+    add.textContent = "+";
+    add.title = "Add vault";
+    add.addEventListener("click", () => {
+      this.dispatchEvent(new CustomEvent("vault-add", { bubbles: true, composed: true }));
+    });
+    header.append(title, add);
     root.appendChild(header);
 
     const list = document.createElement("div");
@@ -141,20 +141,6 @@ export class LSVaults extends HTMLElement {
     }
 
     root.appendChild(list);
-
-    // Footer: + Add vault action. Hidden when there are no vaults because
-    // the main pane's empty state already offers a prominent CTA.
-    if (this.#vaults.length > 0) {
-      const footer = document.createElement("div");
-      footer.className = "footer";
-      const add = document.createElement("button");
-      add.textContent = "+ Add vault";
-      add.addEventListener("click", () => {
-        this.dispatchEvent(new CustomEvent("vault-add", { bubbles: true, composed: true }));
-      });
-      footer.appendChild(add);
-      root.appendChild(footer);
-    }
   }
 
   #row(v: VaultRecord): HTMLElement {

@@ -159,15 +159,10 @@ export class LSModal extends HTMLElement {
     btn.className = "btn";
     btn.textContent = "Verify token";
 
-    const cancelBtn = document.createElement("button");
-    cancelBtn.className = "btn btn-secondary";
-    cancelBtn.textContent = "Cancel";
-    cancelBtn.addEventListener("click", () => this.#cancel());
-
     const status = document.createElement("div");
     status.className = "status";
 
-    step.append(btn, cancelBtn, status);
+    step.append(btn, status);
     this.#shadow.appendChild(step);
 
     const go = async (): Promise<void> => {
@@ -241,26 +236,17 @@ export class LSModal extends HTMLElement {
     const connectBtn = document.createElement("button");
     connectBtn.className = "btn";
     connectBtn.textContent = "Connect";
-    const backBtn = document.createElement("button");
-    backBtn.className = "btn btn-secondary";
-    backBtn.textContent = "← Back";
-    const cancelBtn = document.createElement("button");
-    cancelBtn.className = "btn btn-secondary";
-    cancelBtn.textContent = "Cancel";
-    cancelBtn.addEventListener("click", () => this.#cancel());
 
     const status = document.createElement("div");
     status.className = "status";
 
-    step.append(connectBtn, backBtn, cancelBtn, status);
+    step.append(connectBtn, status);
     this.#shadow.appendChild(step);
 
     requestAnimationFrame(() => {
       input.focus();
       input.setSelectionRange(input.value.length, input.value.length);
     });
-
-    backBtn.addEventListener("click", () => this.#renderStep1());
 
     const go = async (): Promise<void> => {
       const repoName = input.value.trim();
@@ -271,7 +257,6 @@ export class LSModal extends HTMLElement {
         return;
       }
       connectBtn.disabled = true;
-      backBtn.disabled = true;
       input.classList.remove("error");
       status.className = "status";
       status.textContent = "Connecting…";
@@ -292,7 +277,6 @@ export class LSModal extends HTMLElement {
         status.className = "status error-msg";
         status.textContent = (err as Error).message;
         connectBtn.disabled = false;
-        backBtn.disabled = false;
       }
     };
 

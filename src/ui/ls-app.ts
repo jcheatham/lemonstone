@@ -399,6 +399,13 @@ export class LSApp extends HTMLElement {
   #shareAcceptModal!: LSShareAcceptModal;
   /** UI selection in the Vaults subnav. Independent of the active vault. */
   #selectedVaultId: string | null = null;
+  /** Label of the selected vault — cached for mobile breadcrumb rendering. */
+  #selectedVaultLabel = "";
+  /** True once the user has explicitly drilled into a vault on the Vaults
+   *  category. Used on mobile to gate the level-1 → level-2 transition so
+   *  the default (auto-select current vault for desktop detail view) doesn't
+   *  collapse the mobile experience straight to the detail pane. */
+  #vaultDrillActive = false;
   #authModal!: LSModal;
   #unlockModal!: LSUnlockModal;
   #encryptFolderModal!: LSEncryptFolderModal;
@@ -594,7 +601,11 @@ export class LSApp extends HTMLElement {
     this.#vaults.addEventListener("vault-select", (e) => {
       const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
       this.#selectedVaultId = vaultId;
-      this.#refreshVaultDetail();
+      this.#vaultDrillActive = true;
+      this.#refreshVaultDetail().catch(console.error);
+      // Bump mobile state so the detail view becomes level 2 (and the
+      // breadcrumb grows a third segment).
+      this.#updateMobileState();
     });
     this.#vaults.addEventListener("vault-add", () => {
       this.#showAuthOverlay();
@@ -831,14 +842,18 @@ export class LSApp extends HTMLElement {
     this.#showPanel(id);
     this.#categoryPanel.classList.remove("dimmed");
     // Vaults category hijacks the main pane to show a detail card. Every
-    // other category leaves the editor in place.
+    // other category leaves the editor in place. Entering the Vaults
+    // category always starts at the list (no drilled-in vault) so the
+    // mobile pattern matches Files (subnav first, detail on click).
     if (id === "vaults") {
       this.#editorWrap.style.display = "none";
       this.#vaultDetail.style.display = "flex";
+      this.#vaultDrillActive = false;
       this.#refreshVaultDetail().catch(console.error);
     } else {
       this.#vaultDetail.style.display = "none";
       this.#editorWrap.style.display = "";
+      this.#vaultDrillActive = false;
     }
     // Category-specific activation that used to live in the preview handler:
     if (id === "search") requestAnimationFrame(() => this.#search.focus());
@@ -854,6 +869,13 @@ export class LSApp extends HTMLElement {
     }
     if (this.#activeCommitOid && this.#categoryNav.active === "history") {
       return this.#activeCommitOid.slice(0, 7);
+    }
+    if (
+      this.#activeCategory === "vaults" &&
+      this.#vaultDrillActive &&
+      this.#selectedVaultLabel
+    ) {
+      return this.#selectedVaultLabel;
     }
     return null;
   }
@@ -907,6 +929,8 @@ export class LSApp extends HTMLElement {
       if (this.#activePath) navigateHome();
       else this.#showWelcome();
     }
+    // Unwinding past level 2 also clears any vault drill-in.
+    this.#vaultDrillActive = false;
     if (level <= 0) {
       // Also undrill back to picker.
       this.#categoryNav.mode = "picker";
@@ -1715,11 +1739,13 @@ export class LSApp extends HTMLElement {
     if (!this.#vaultDetail) return;
     const vaults = await multiplexer.listVaults();
     if (vaults.length === 0) {
+      this.#selectedVaultLabel = "";
       this.#vaultDetail.setSnapshot(null);
       return;
     }
     const id = this.#selectedVaultId ?? multiplexer.currentVaultId ?? vaults[0]!.id;
     const record = vaults.find((v) => v.id === id) ?? vaults[0]!;
+    this.#selectedVaultLabel = record.label;
     const isCurrent = multiplexer.currentVaultId === record.id;
     const current = multiplexer.currentVault;
     const snapshot: VaultDetailSnapshot = {
