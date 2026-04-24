@@ -53,6 +53,11 @@ export default defineConfig({
         display: "standalone",
         background_color: "#1a1a2e",
         theme_color: "#1a1a2e",
+        // When installed, prefer opening in-scope links (including share
+        // links like `#/share/<blob>`) in the PWA rather than the browser
+        // tab. Supported on Chromium/Android; iOS 16.4+ honors this for
+        // home-screen PWAs, older Safari falls back to opening in Safari.
+        handle_links: "preferred",
         icons: [
           { src: "icons/lemonstone_192.png", sizes: "192x192", type: "image/png" },
           { src: "icons/lemonstone_512.png", sizes: "512x512", type: "image/png" },
