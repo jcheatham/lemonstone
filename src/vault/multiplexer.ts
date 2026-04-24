@@ -47,10 +47,57 @@ const FORWARDED_EVENTS = [
   "note:tagIndexChanged",
 ] as const;
 
+/** Cross-context change signal. Multiple tabs / PWAs of the same origin
+ *  share IndexedDB but don't get notified of each other's writes — this
+ *  channel fills that gap so a vault added in (say) an embedded browser
+ *  shows up in an already-loaded PWA without a reload. */
+const BROADCAST_CHANNEL = "lemonstone:vaults";
+type BroadcastKind =
+  | "vaults:changed"
+  | "vaults:currentChanged";
+interface BroadcastMessage {
+  kind: BroadcastKind;
+  /** Random per-tab token so listeners can skip messages they originated. */
+  from: string;
+}
+
 export class VaultMultiplexer extends EventTarget {
   #current: VaultService | null = null;
   #switchLock: Promise<void> = Promise.resolve();
   #forwardingCleanup: (() => void) | null = null;
+  #senderId: string;
+  #channel: BroadcastChannel | null = null;
+
+  constructor() {
+    super();
+    // BroadcastChannel is widely supported (Chromium, Firefox, Safari 15.4+).
+    // If unavailable, we fall back to the visibilitychange-based refresh in
+    // ls-app — no cross-context push, but at least it self-heals on focus.
+    this.#senderId = typeof crypto?.randomUUID === "function"
+      ? crypto.randomUUID()
+      : String(Date.now()) + String(Math.random());
+    try {
+      this.#channel = new BroadcastChannel(BROADCAST_CHANNEL);
+      this.#channel.addEventListener("message", (e) => {
+        const msg = e.data as BroadcastMessage | undefined;
+        if (!msg || msg.from === this.#senderId) return;
+        // Re-dispatch as a local event — UI listens on the multiplexer.
+        this.dispatchEvent(new Event(msg.kind));
+      });
+    } catch {
+      this.#channel = null;
+    }
+  }
+
+  /** Post a change event to other tabs / PWA instances sharing this origin. */
+  #broadcast(kind: BroadcastKind): void {
+    if (!this.#channel) return;
+    try {
+      this.#channel.postMessage({ kind, from: this.#senderId } as BroadcastMessage);
+    } catch (err) {
+      console.warn("[mux] broadcast failed:", err);
+    }
+  }
 
   get currentVault(): VaultService | null { return this.#current; }
   get currentVaultId(): string | null { return this.#current?.vaultId ?? null; }
@@ -75,6 +122,7 @@ export class VaultMultiplexer extends EventTarget {
     await saveTokens(dbNameFor(id), tokens);
     await putVault(record);
     this.dispatchEvent(new Event("vaults:changed"));
+    this.#broadcast("vaults:changed");
     return record;
   }
 
@@ -83,6 +131,7 @@ export class VaultMultiplexer extends EventTarget {
     if (!record) return;
     await putVault({ ...record, label });
     this.dispatchEvent(new Event("vaults:changed"));
+    this.#broadcast("vaults:changed");
   }
 
   async removeVault(id: string): Promise<void> {
@@ -107,6 +156,8 @@ export class VaultMultiplexer extends EventTarget {
     await removeVaultRecord(id);
     this.dispatchEvent(new Event("vaults:changed"));
     this.dispatchEvent(new Event("vaults:currentChanged"));
+    this.#broadcast("vaults:changed");
+    this.#broadcast("vaults:currentChanged");
   }
 
   // ── Open / switch current vault ─────────────────────────────────────────
@@ -148,6 +199,7 @@ export class VaultMultiplexer extends EventTarget {
       await setCurrentVaultId(record.id);
       await touchVaultOpened(record.id);
       this.dispatchEvent(new Event("vaults:currentChanged"));
+      this.#broadcast("vaults:currentChanged");
       return service;
     };
 

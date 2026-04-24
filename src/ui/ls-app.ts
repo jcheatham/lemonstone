@@ -406,6 +406,9 @@ export class LSApp extends HTMLElement {
    *  the default (auto-select current vault for desktop detail view) doesn't
    *  collapse the mobile experience straight to the detail pane. */
   #vaultDrillActive = false;
+  /** Last-known vaults list. Populated by #refreshVaultsList so sync
+   *  handlers (like vault-select) can look up a record without awaiting. */
+  #cachedVaults: { id: string; label: string; repoFullName: string; repoDefaultBranch: string; createdAt: number; lastOpenedAt: number }[] = [];
   #authModal!: LSModal;
   #unlockModal!: LSUnlockModal;
   #encryptFolderModal!: LSEncryptFolderModal;
@@ -431,12 +434,25 @@ export class LSApp extends HTMLElement {
     this.#startStatusTicker();
     this.#init().catch(console.error);
     document.addEventListener("keydown", this.#onGlobalKey);
+    // Re-read the manifest whenever this context becomes visible. IDB
+    // doesn't push change events, so if another context (another tab, a
+    // webview inside a messaging app, etc.) added or removed a vault while
+    // this app was backgrounded, the list here would silently go stale.
+    // BroadcastChannel covers the live case; this covers the "came back
+    // from sleep/resume" case where messages may have been missed.
+    document.addEventListener("visibilitychange", this.#onVisibilityChange);
   }
 
   disconnectedCallback(): void {
     window.removeEventListener("route", this.#onRoute);
     document.removeEventListener("keydown", this.#onGlobalKey);
+    document.removeEventListener("visibilitychange", this.#onVisibilityChange);
   }
+
+  #onVisibilityChange = (): void => {
+    if (document.visibilityState !== "visible") return;
+    this.#refreshVaultsList().catch(console.error);
+  };
 
   #onGlobalKey = (e: KeyboardEvent): void => {
     const mod = e.ctrlKey || e.metaKey;
@@ -602,6 +618,14 @@ export class LSApp extends HTMLElement {
       const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
       this.#selectedVaultId = vaultId;
       this.#vaultDrillActive = true;
+      // Update the cached label SYNCHRONOUSLY from the in-memory vault list
+      // so the mobile breadcrumb and detail snapshot below reflect the
+      // clicked vault, not the previously-rendered one. Previously the
+      // label-update was buried inside the awaited #refreshVaultDetail,
+      // and #updateMobileState would fire before it resolved — making the
+      // first click show the stale label.
+      const record = this.#cachedVaults.find((v) => v.id === vaultId);
+      if (record) this.#selectedVaultLabel = record.label;
       this.#refreshVaultDetail().catch(console.error);
       // Bump mobile state so the detail view becomes level 2 (and the
       // breadcrumb grows a third segment).
@@ -1724,6 +1748,7 @@ export class LSApp extends HTMLElement {
   async #refreshVaultsList(): Promise<void> {
     if (!this.#vaults) return;
     const vaults = await multiplexer.listVaults();
+    this.#cachedVaults = vaults;
     this.#vaults.vaults = vaults;
     this.#vaults.currentId = multiplexer.currentVaultId;
     // Auto-select: prefer the current vault, else the first in the list.
@@ -1737,7 +1762,12 @@ export class LSApp extends HTMLElement {
   /** Rebuild the main-pane detail card from the currently-selected vault. */
   async #refreshVaultDetail(): Promise<void> {
     if (!this.#vaultDetail) return;
-    const vaults = await multiplexer.listVaults();
+    // Use the cache if it's populated — keeps this call synchronous for
+    // handlers like vault-select that need an immediate re-render. Fall
+    // back to a fresh read if the cache hasn't been primed yet.
+    const vaults = this.#cachedVaults.length > 0
+      ? this.#cachedVaults
+      : await multiplexer.listVaults();
     if (vaults.length === 0) {
       this.#selectedVaultLabel = "";
       this.#vaultDetail.setSnapshot(null);
