@@ -55,4 +55,28 @@ describe("VaultSearch", () => {
     vs.remove("notes/meeting.md");
     expect(vs.documentCount).toBe(2);
   });
+
+  describe("indexFilename (snippets / filename-only)", () => {
+    it("makes a file findable by its name but not its body", () => {
+      vs.indexFilename("tools/password-generator.html");
+      // The title (filename without extension) is searchable.
+      expect(vs.search("password").map((r) => r.path)).toContain(
+        "tools/password-generator.html"
+      );
+      // But arbitrary tokens that would appear in HTML/JS source are not,
+      // because the body was never indexed.
+      vs.indexFilename("tools/thing.html");
+      expect(vs.search("doctype").map((r) => r.path)).not.toContain("tools/thing.html");
+      expect(vs.search("script").map((r) => r.path)).not.toContain("tools/thing.html");
+    });
+
+    it("replaces cleanly and counts as one document", () => {
+      const before = vs.documentCount;
+      vs.indexFilename("a.html");
+      vs.indexFilename("a.html");
+      expect(vs.documentCount).toBe(before + 1);
+      vs.remove("a.html");
+      expect(vs.documentCount).toBe(before);
+    });
+  });
 });

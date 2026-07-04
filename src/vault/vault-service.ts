@@ -152,6 +152,14 @@ export class VaultService extends EventTarget {
     content: string,
     storedFrontmatter: Record<string, unknown>
   ): void {
+    // Snippets participate in filename search only — their HTML/JS source is
+    // not markdown, so we don't parse it for wikilinks, tags, or full text,
+    // and they stay out of the wikilink namespace.
+    if (VaultService.isSnippet(path)) {
+      this.search.indexFilename(path);
+      return;
+    }
+
     const { frontmatter, body } = parseFrontmatter(content);
     const merged = { ...storedFrontmatter, ...frontmatter };
 
@@ -298,6 +306,18 @@ export class VaultService extends EventTarget {
     );
   }
 
+  // ── Local config ─────────────────────────────────────────────────────────
+  // Per-vault, device-local key/value state that is NOT synced to the repo
+  // (e.g. snippet network-access grants). Lives in the config store.
+
+  getConfig<T>(key: string): Promise<T | null> {
+    return this.storage.getConfig<T>(key);
+  }
+
+  setConfig(key: string, value: unknown): Promise<void> {
+    return this.storage.setConfig(key, value);
+  }
+
   // ── Note API ────────────────────────────────────────────────────────────────
 
   async readNote(path: string): Promise<string | null> {
@@ -359,7 +379,14 @@ export class VaultService extends EventTarget {
 
   /** Extensions that are treated as notes (stored in the notes store, opened
    *  in the markdown/text editor). Mirror of sync-engine's TEXT_EXTENSIONS. */
-  static readonly #NOTE_EXTENSIONS = new Set([".md", ".txt"]);
+  static readonly #NOTE_EXTENSIONS = new Set([".md", ".txt", ".html"]);
+
+  /** HTML/JS snippets live in the notes store as text but render in the
+   *  sandboxed snippet view and are indexed by filename only (no wikilink,
+   *  tag, or full-text parsing of their source). See docs/snippets.md. */
+  static isSnippet(path: string): boolean {
+    return path.toLowerCase().endsWith(".html");
+  }
 
   static #kindFromPath(path: string): "note" | "canvas" | "unknown" {
     if (path.endsWith(".canvas")) return "canvas";

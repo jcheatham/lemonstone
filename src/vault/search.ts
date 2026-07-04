@@ -57,6 +57,17 @@ export class VaultSearch {
     }
   }
 
+  /** Index a file by filename/title only (empty body and tags). Used for
+   *  snippets and other non-markdown files that should be findable by name
+   *  but whose contents shouldn't pollute full-text search. */
+  indexFilename(path: string): void {
+    const filename = path.split("/").pop() ?? path;
+    const title = filename.replace(/\.[^.]+$/, "");
+    const doc: SearchDoc = { id: path, path, title, body: "", tags: "" };
+    if (this.ms.has(path)) this.ms.replace(doc);
+    else this.ms.add(doc);
+  }
+
   remove(path: string): void {
     if (this.ms.has(path)) {
       this.ms.discard(path);

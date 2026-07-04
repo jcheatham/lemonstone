@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Mirror index.html's production CSP (plus frame-src) so the spike is a
+         faithful test of behavior under the real policy. -->
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://api.github.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-src 'self';" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Snippet sandbox spike</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 0; display: grid; grid-template-columns: 1fr 1fr; height: 100vh; }
+      #left { padding: 16px; overflow: auto; border-right: 1px solid #ccc; }
+      #right { display: flex; flex-direction: column; }
+      #frame-host { flex: 0 0 auto; border-bottom: 1px solid #ccc; }
+      #log { flex: 1; overflow: auto; padding: 8px 12px; font: 12px ui-monospace, monospace; background: #0b0b12; color: #cdd; }
+      .row { white-space: pre-wrap; padding: 1px 0; }
+      .row.meta  { color: #7dd3fc; }
+      .row.diag  { color: #fbbf24; }
+      .row.error { color: #f87171; }
+      .row.warn  { color: #fcd34d; }
+      button { font: inherit; padding: 6px 12px; margin: 0 6px 8px 0; cursor: pointer; }
+      h1 { font-size: 16px; }
+      p.note { color: #555; max-width: 40ch; }
+    </style>
+  </head>
+  <body>
+    <div id="left">
+      <h1>Snippet sandbox spike</h1>
+      <p class="note">Open in Chrome <em>and</em> Safari. Verify: the tool runs,
+        console is captured, external script + ungranted fetch are CSP-blocked,
+        granted fetch is allowed, and the isolation probe cannot read the
+        top-window token / storage.</p>
+      <button id="btn-tool">Run tool</button>
+      <button id="btn-ext">External script (expect blocked)</button>
+      <button id="btn-fetch-deny">fetch — no grant (expect blocked)</button>
+      <button id="btn-fetch-allow">fetch — granted (expect allowed)</button>
+      <button id="btn-probe">Isolation probe (expect all blocked)</button>
+    </div>
+    <div id="right">
+      <div id="frame-host"></div>
+      <div id="log"></div>
+    </div>
+    <script type="module" src="/src/snippet/spike-harness.ts"></script>
+  </body>
+</html>

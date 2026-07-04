@@ -7,7 +7,7 @@
 //
 // Events (bubbles, composed):
 //   file-open   — detail: { path: string }
-//   file-new    — detail: { folder: string; kind: "note" | "canvas" | "folder"; name: string }
+//   file-new    — detail: { folder: string; kind: "note" | "canvas" | "folder" | "snippet"; name: string }
 //   file-rename — detail: { oldPath: string; newPath: string }
 //   zone-toggle — detail: { prefix: string; unlocked: boolean } — user clicked the lock badge
 //
@@ -239,9 +239,10 @@ export class LSFileTree extends HTMLElement {
     this.#menu = document.createElement("div");
     this.#menu.className = "new-menu";
 
-    const items: Array<{ label: string; kind: "note" | "canvas" | "folder" }> = [
+    const items: Array<{ label: string; kind: "note" | "canvas" | "folder" | "snippet" }> = [
       { label: "New note", kind: "note" },
       { label: "New canvas", kind: "canvas" },
+      { label: "New snippet", kind: "snippet" },
       { label: "New folder", kind: "folder" },
     ];
     for (const item of items) {
@@ -508,6 +509,16 @@ export class LSFileTree extends HTMLElement {
 
     const base = path.split("/").pop() ?? path;
 
+    // Snippets (.html) get a distinct </> glyph so they read differently from
+    // markdown notes and canvases in the tree.
+    if (base.toLowerCase().endsWith(".html")) {
+      const icon = document.createElement("span");
+      icon.className = "file-icon";
+      icon.textContent = "</>";
+      icon.style.cssText = "font: 10px ui-monospace, monospace; opacity: 0.6; margin-right: 5px;";
+      div.appendChild(icon);
+    }
+
     const nameSpan = document.createElement("span");
     nameSpan.className = "file-name";
     nameSpan.textContent = base;
@@ -658,7 +669,7 @@ export class LSFileTree extends HTMLElement {
     input.addEventListener("click", (e) => e.stopPropagation());
   }
 
-  #emitNew(folder: string, kind: "note" | "canvas" | "folder", name: string): void {
+  #emitNew(folder: string, kind: "note" | "canvas" | "folder" | "snippet", name: string): void {
     this.dispatchEvent(
       new CustomEvent("file-new", {
         bubbles: true,
@@ -674,7 +685,7 @@ export class LSFileTree extends HTMLElement {
    * on blur (empty input cancels). Matches the double-click-to-rename UX
    * pattern so the new-file flow feels like a natural extension of it.
    */
-  #startInline(folder: string, kind: "note" | "canvas" | "folder"): void {
+  #startInline(folder: string, kind: "note" | "canvas" | "folder" | "snippet"): void {
     // Expand the parent folder if it's collapsed so the placeholder is visible.
     if (folder && this.#collapsedFolders.has(folder)) {
       this.#collapsedFolders.delete(folder);
@@ -707,7 +718,9 @@ export class LSFileTree extends HTMLElement {
       ? "folder name"
       : kind === "canvas"
         ? "canvas name"
-        : "note name";
+        : kind === "snippet"
+          ? "snippet name"
+          : "note name";
     row.appendChild(input);
 
     // Place at top of the container so it's visible even if the folder has

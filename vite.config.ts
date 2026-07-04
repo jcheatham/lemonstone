@@ -1,7 +1,56 @@
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { build as esbuildBuild } from "esbuild";
 import { VitePWA } from "vite-plugin-pwa";
+
+// The snippet sandbox host (sandbox.html) loads at an opaque origin, where a
+// `type="module"` script would be CORS-blocked on a static host. So we inline
+// the bundled host as a CLASSIC (no-CORS) inline script. The TS source in
+// src/snippet stays the single source of truth (and unit-tested); esbuild
+// bundles it to an IIFE and this plugin substitutes it for a placeholder in
+// sandbox.html — in dev (via middleware) and build (via emitted asset).
+async function bundleSandboxHost(): Promise<string> {
+  const entry = fileURLToPath(new URL("./src/snippet/sandbox-host.ts", import.meta.url));
+  const res = await esbuildBuild({
+    entryPoints: [entry],
+    bundle: true,
+    format: "iife",
+    target: "es2022",
+    minify: true,
+    write: false,
+    legalComments: "none",
+  });
+  return res.outputFiles![0]!.text;
+}
+
+function sandboxHostPlugin(): Plugin {
+  const PLACEHOLDER = "<!--LEMONSTONE_SANDBOX_HOST-->";
+  const htmlPath = fileURLToPath(new URL("./sandbox.html", import.meta.url));
+  const inline = async (): Promise<string> => {
+    const raw = readFileSync(htmlPath, "utf8");
+    const code = await bundleSandboxHost();
+    return raw.replace(PLACEHOLDER, `<script>${code}</script>`);
+  };
+  return {
+    name: "lemonstone-sandbox-host",
+    configureServer(server) {
+      server.middlewares.use(async (req, res, next) => {
+        const path = (req.url ?? "").split("?")[0];
+        if (path && path.endsWith("/sandbox.html")) {
+          res.setHeader("Content-Type", "text/html");
+          res.end(await inline());
+          return;
+        }
+        next();
+      });
+    },
+    async generateBundle() {
+      this.emitFile({ type: "asset", fileName: "sandbox.html", source: await inline() });
+    },
+  };
+}
 
 function getBuildSha(): string {
   // GitHub Actions sets GITHUB_SHA on every run.
@@ -41,6 +90,7 @@ export default defineConfig({
     },
   },
   plugins: [
+    sandboxHostPlugin(),
     VitePWA({
       registerType: "prompt",
       includeAssets: ["icons/icon.svg", "icons/lemonstone_128.png"],
@@ -82,6 +132,10 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: "index.html",
+        // NOTE: sandbox.html is intentionally NOT a Rollup HTML entry. It is
+        // emitted by sandboxHostPlugin() with the host bundled as a classic
+        // inline script (opaque-origin module fetches are CORS-blocked). See
+        // docs/snippets.md.
       },
     },
   },

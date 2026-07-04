@@ -25,6 +25,8 @@ import "./ls-calendar.ts";
 import type { LSCalendar } from "./ls-calendar.ts";
 import "./ls-canvas.ts";
 import type { LSCanvas } from "./ls-canvas.ts";
+import "./ls-snippet.ts";
+import { snippetTemplate } from "../snippet/template.ts";
 import "./ls-history.ts";
 import type { LSHistory, CommitSummary } from "./ls-history.ts";
 import "./ls-vaults.ts";
@@ -49,6 +51,10 @@ import type { LSCommandPalette } from "./ls-command-palette.ts";
 import type { LSSwitcher } from "./ls-switcher.ts";
 import type { LSEditor } from "./ls-editor.ts";
 import type { LSSearch } from "./ls-search.ts";
+import type { LSSnippet } from "./ls-snippet.ts";
+
+// Config key for per-snippet network-access grants (local, per-vault, unsynced).
+const SNIPPET_GRANTS_KEY = "snippet:connect-grants";
 
 const style = `
   :host {
@@ -520,13 +526,16 @@ export class LSApp extends HTMLElement {
       this.#drillInto("files");
     });
     this.#fileTree.addEventListener("file-new", (e) => {
-      const { folder, kind, name } = (e as CustomEvent<{ folder: string; kind: "note" | "canvas" | "folder"; name: string }>).detail;
+      const { folder, kind, name } = (e as CustomEvent<{ folder: string; kind: "note" | "canvas" | "folder" | "snippet"; name: string }>).detail;
       switch (kind) {
         case "note":
           this.#newNote(folder, name).catch(console.error);
           break;
         case "canvas":
           this.#newCanvas(folder, name).catch(console.error);
+          break;
+        case "snippet":
+          this.#newSnippet(folder, name).catch(console.error);
           break;
         case "folder":
           this.#newFolder(folder, name).catch(console.error);
@@ -1371,6 +1380,99 @@ export class LSApp extends HTMLElement {
     }
   }
 
+  async #openSnippet(path: string): Promise<void> {
+    if (this.#promptUnlockIfLocked(path)) {
+      this.#mountLockedPlaceholder(path);
+      return;
+    }
+    let content = "";
+    try {
+      content = (await vaultService.readNote(path)) ?? "";
+    } catch (err) {
+      if ((err as Error)?.name === "ZoneLockedError") {
+        this.#promptUnlockIfLocked(path);
+        this.#mountLockedPlaceholder(path);
+        return;
+      }
+      content = "";
+    }
+    if (!content && this.#pendingContent) content = this.#pendingContent;
+    this.#pendingContent = "";
+    const grants = await this.#snippetGrantsForPath(path);
+    this.#mountSnippet(path, content, grants);
+  }
+
+  #mountSnippet(path: string, content: string, grantedOrigins: string[]): void {
+    this.#editorWrap.innerHTML = "";
+    const view = document.createElement("ls-snippet") as LSSnippet;
+    view.style.cssText = "display:flex;height:100%;width:100%;";
+    view.path = path;
+    view.value = content;
+    view.grantedOrigins = grantedOrigins;
+    view.addEventListener("input", (e) => {
+      const detail = (e as CustomEvent<{ content: string; path: string }>).detail;
+      if (!detail || typeof detail.content !== "string") return;
+      this.#onEditorInput(detail.content, detail.path);
+    });
+    view.addEventListener("snippet-grant-request", (e) => {
+      const { path: p, origins } = (e as CustomEvent<{ path: string; origins: string[] }>).detail;
+      this.#addSnippetGrant(p, origins)
+        .then((merged) => {
+          view.grantedOrigins = merged;
+          getToast().show(`Granted network access: ${origins.join(", ")}`, "success", 3000);
+        })
+        .catch(console.error);
+    });
+    this.#editorWrap.appendChild(view);
+    this.#editor = null;
+    this.#lastLoadedContent = content;
+    // Snippets have no outline/backlinks.
+    this.#outline.headings = [];
+    this.#backlinks.path = path;
+    this.#backlinks.links = [];
+  }
+
+  // ── Snippet network grants ─────────────────────────────────────────────────
+  // Local, per-vault consent: which origins the user has allowed each snippet
+  // to reach. Stored in the config store (not synced to the repo), so a synced
+  // malicious edit can't silently re-enable network — each device grants once.
+
+  async #snippetGrants(): Promise<Record<string, string[]>> {
+    return (await vaultService.getConfig<Record<string, string[]>>(SNIPPET_GRANTS_KEY)) ?? {};
+  }
+
+  async #snippetGrantsForPath(path: string): Promise<string[]> {
+    return (await this.#snippetGrants())[path] ?? [];
+  }
+
+  async #addSnippetGrant(path: string, origins: string[]): Promise<string[]> {
+    const grants = await this.#snippetGrants();
+    const merged = [...new Set([...(grants[path] ?? []), ...origins])];
+    grants[path] = merged;
+    await vaultService.setConfig(SNIPPET_GRANTS_KEY, grants);
+    return merged;
+  }
+
+  /** Drop a grant when its snippet is deleted so it can't silently apply to a
+   *  future file created at the same path. */
+  async #removeSnippetGrant(path: string): Promise<void> {
+    if (!path.toLowerCase().endsWith(".html")) return;
+    const grants = await this.#snippetGrants();
+    if (!(path in grants)) return;
+    delete grants[path];
+    await vaultService.setConfig(SNIPPET_GRANTS_KEY, grants);
+  }
+
+  /** Move a grant with its snippet on rename so consent isn't re-prompted. */
+  async #migrateSnippetGrant(oldPath: string, newPath: string): Promise<void> {
+    if (!oldPath.toLowerCase().endsWith(".html")) return;
+    const grants = await this.#snippetGrants();
+    if (!(oldPath in grants)) return;
+    grants[newPath] = grants[oldPath]!;
+    delete grants[oldPath];
+    await vaultService.setConfig(SNIPPET_GRANTS_KEY, grants);
+  }
+
   #mountEditor(path: string, content: string): void {
     this.#editorWrap.innerHTML = "";
     const ed = document.createElement("ls-editor") as LSEditor;
@@ -1931,9 +2033,14 @@ export class LSApp extends HTMLElement {
     this.#calendar.activePath = path;
     this.#conflictBanner.classList.remove("visible");
 
-    // Route by file extension. .canvas → <ls-canvas>, everything else → editor.
+    // Route by file extension. .canvas → <ls-canvas>, .html → <ls-snippet>,
+    // everything else → editor.
     if (path.endsWith(".canvas")) {
       await this.#openCanvas(path);
+      return;
+    }
+    if (path.toLowerCase().endsWith(".html")) {
+      await this.#openSnippet(path);
       return;
     }
 
@@ -2068,7 +2175,10 @@ export class LSApp extends HTMLElement {
           this.#lastLoadedContent = content;
         }
         this.#setStatus("ok", "Saved");
-        this.#updateSidebarPanels(path, content);
+        // Snippets aren't markdown — no outline/backlinks to recompute.
+        if (!path.toLowerCase().endsWith(".html")) {
+          this.#updateSidebarPanels(path, content);
+        }
       } catch (err) {
         this.#setStatus("error", "Save failed");
         console.error(err);
@@ -2089,6 +2199,20 @@ export class LSApp extends HTMLElement {
     }
     const title = filename.endsWith(".md") ? filename.slice(0, -3) : filename;
     await vaultService.writeNote(path, `# ${title}\n\n`);
+    navigateTo(path);
+  }
+
+  async #newSnippet(folder = "", name?: string): Promise<void> {
+    const base = name?.trim() || `Untitled-${Date.now()}`;
+    const filename = base.toLowerCase().endsWith(".html") ? base : `${base}.html`;
+    const path = folder ? `${folder}/${filename}` : filename;
+    if ((await vaultService.readNote(path)) !== null) {
+      getToast().show(`${path} already exists`, "info", 4000);
+      navigateTo(path);
+      return;
+    }
+    const title = filename.replace(/\.html$/i, "");
+    await vaultService.writeNote(path, snippetTemplate(title));
     navigateTo(path);
   }
 
@@ -2224,6 +2348,7 @@ export class LSApp extends HTMLElement {
     const toDelete = this.#activePath;
     try {
       await vaultService.delete(toDelete);
+      await this.#removeSnippetGrant(toDelete);
       await this.#loadNoteList();
       navigateHome();
     } catch (err) {
@@ -2236,6 +2361,7 @@ export class LSApp extends HTMLElement {
     if (oldPath === newPath) return;
     vaultService.rename(oldPath, newPath)
       .then(async () => {
+        await this.#migrateSnippetGrant(oldPath, newPath);
         await this.#loadNoteList();
         if (this.#activePath === oldPath) {
           navigateTo(newPath);
@@ -2280,6 +2406,7 @@ export class LSApp extends HTMLElement {
   #registerCommands(): void {
     this.#palette.register({ id: "new-note", label: "New note", description: "Create a new note", shortcut: "Ctrl+N" });
     this.#palette.register({ id: "new-canvas", label: "New canvas", description: "Create a new JSON Canvas file" });
+    this.#palette.register({ id: "new-snippet", label: "New snippet", description: "Create a new HTML/JS snippet" });
     this.#palette.register({ id: "show-history", label: "Show recent commits", description: "List the last 30 commits on the current branch" });
     this.#palette.register({ id: "new-folder", label: "New folder…", description: "Create a folder with a placeholder README" });
     this.#palette.register({ id: "rename-folder", label: "Rename folder…", description: "Rename a folder and all files inside" });
@@ -2351,6 +2478,9 @@ export class LSApp extends HTMLElement {
         break;
       case "new-canvas":
         this.#newCanvas().catch(console.error);
+        break;
+      case "new-snippet":
+        this.#newSnippet("").catch(console.error);
         break;
       case "new-folder":
         this.#newFolder().catch(console.error);

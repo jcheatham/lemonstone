@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lemonstone snippet sandbox</title>
+    <!--
+      Intentionally NO Content-Security-Policy here. This document is only ever
+      loaded inside an opaque-origin <iframe sandbox="allow-scripts"> and it
+      immediately renders untrusted snippets into nested frames whose own <meta>
+      CSP tightens from this unrestricted base. See docs/snippets.md.
+    -->
+    <style>
+      html, body { margin: 0; padding: 0; background: transparent; }
+    </style>
+  </head>
+  <body>
+    <!--
+      The host is inlined here as a CLASSIC script by the lemonstone-sandbox-host
+      Vite plugin. It must NOT be an external module: this document loads at an
+      opaque origin (sandbox="allow-scripts"), and a `type="module"` fetch from a
+      null origin is CORS-blocked by static hosts. A classic inline script has no
+      such fetch. See docs/snippets.md.
+    -->
+    <!--LEMONSTONE_SANDBOX_HOST-->
+  </body>
+</html>

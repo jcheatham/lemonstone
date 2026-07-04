@@ -23,7 +23,9 @@ import type { WorkerEvent } from "./protocol.ts";
 const GIT_DIR = "/"; // root of the OPFS adapter — all paths relative here
 // Text-ish extensions get treated like notes (stored in the notes store,
 // opened in the markdown/text editor). Easy to extend as we add support.
-const TEXT_EXTENSIONS = new Set([".md", ".txt"]);
+// .html snippets are text files too — they route into the notes store here and
+// render in the sandboxed snippet view. See docs/snippets.md.
+const TEXT_EXTENSIONS = new Set([".md", ".txt", ".html"]);
 const CONTENT_EXTENSIONS = new Set([...TEXT_EXTENSIONS, ".canvas"]);
 const ATTACHMENT_EXTENSIONS = new Set([
   ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
