@@ -2,12 +2,12 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <!-- Mirror index.html's production CSP (plus frame-src) so the spike is a
-         faithful test of behavior under the real policy. -->
+    <!-- Mirror index.html's production CSP (plus frame-src) so this harness is
+         a faithful test of behavior under the real policy. -->
     <meta http-equiv="Content-Security-Policy"
       content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://api.github.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-src 'self';" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Snippet sandbox spike</title>
+    <title>Snippet sandbox e2e harness</title>
     <style>
       body { font: 14px system-ui, sans-serif; margin: 0; display: grid; grid-template-columns: 1fr 1fr; height: 100vh; }
       #left { padding: 16px; overflow: auto; border-right: 1px solid #ccc; }
@@ -26,7 +26,7 @@
   </head>
   <body>
     <div id="left">
-      <h1>Snippet sandbox spike</h1>
+      <h1>Snippet sandbox e2e harness</h1>
       <p class="note">Open in Chrome <em>and</em> Safari. Verify: the tool runs,
         console is captured, external script + ungranted fetch are CSP-blocked,
         granted fetch is allowed, and the isolation probe cannot read the
@@ -41,6 +41,6 @@
       <div id="frame-host"></div>
       <div id="log"></div>
     </div>
-    <script type="module" src="/src/snippet/spike-harness.ts"></script>
+    <script type="module" src="./snippet-sandbox-harness.ts"></script>
   </body>
 </html>

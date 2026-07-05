@@ -1,7 +1,8 @@
-// DEV-ONLY harness for <ls-snippet>. Served at /spike-snippet-view.html by
-// `npm run dev`; not a build input, so it never ships.
-import "../ui/ls-snippet.ts";
-import type { LSSnippet } from "../ui/ls-snippet.ts";
+// E2E test fixture for <ls-snippet>. Served at
+// /tests/e2e/fixtures/snippet-view-harness.html by `npm run dev`; not a build
+// input, so it never ships. Driven by tests/e2e/snippet-view.spec.ts.
+import "../../../src/ui/ls-snippet.ts";
+import type { LSSnippet } from "../../../src/ui/ls-snippet.ts";
 
 const el = document.createElement("ls-snippet") as LSSnippet;
 el.path = "tools/net.html";

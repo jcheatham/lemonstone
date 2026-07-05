@@ -8,7 +8,7 @@ const log = "#log";
 
 test.describe("snippet sandbox", () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto("/spike-snippet.html");
+    await page.goto("/tests/e2e/fixtures/snippet-sandbox-harness.html");
     await expect(page.locator(log)).toContainText("host ready");
   });
 

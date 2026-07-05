@@ -1,13 +1,15 @@
 import { defineConfig, devices } from "@playwright/test";
 
-// E2E config. Today it covers the snippet sandbox (the one feature with
-// security-critical browser behavior that unit tests in happy-dom cannot
-// exercise — real CSP enforcement, opaque-origin isolation, per-snippet
-// connect-src). M11 can broaden testDir coverage to the whole app.
+// E2E config. Covers the snippet sandbox (security-critical browser behavior
+// that unit tests in happy-dom cannot exercise — real CSP enforcement,
+// opaque-origin isolation, per-snippet connect-src) and the file-tree context
+// menu / drag-to-move (real pointer, drag, and hover-media-query behavior).
+// M11 can broaden testDir coverage to the whole app.
 //
-// Tests drive the dev-only harness pages (spike-snippet.html /
-// spike-snippet-view.html), which are served by `npm run dev` and excluded from
-// the production build.
+// Tests drive dev-only fixture pages under tests/e2e/fixtures/
+// (snippet-sandbox-harness.html, snippet-view-harness.html,
+// file-tree-harness.html), served by `npm run dev` and excluded from the
+// production build.
 export default defineConfig({
   testDir: "./tests/e2e",
   timeout: 30_000,
@@ -22,7 +24,7 @@ export default defineConfig({
   },
   webServer: {
     command: "npm run dev",
-    url: "http://localhost:5173/spike-snippet.html",
+    url: "http://localhost:5173/tests/e2e/fixtures/snippet-sandbox-harness.html",
     reuseExistingServer: !process.env["CI"],
     timeout: 60_000,
   },

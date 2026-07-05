@@ -5,12 +5,9 @@
 // Events (bubbles, composed):
 //   palette-command — detail: { id: string }  (fired when a command is selected)
 
-export interface PaletteCommand {
-  id: string;
-  label: string;
-  description?: string;
-  shortcut?: string;
-}
+export type { PaletteCommand } from "./command-types.ts";
+import type { PaletteCommand, CommandCategory } from "./command-types.ts";
+import { groupByCategory, CATEGORY_LABELS } from "./command-types.ts";
 
 const style = `
   :host { display: none; }
@@ -90,11 +87,21 @@ const style = `
     color: var(--ls-color-fg-muted, #64748b);
     font-size: 13px;
   }
+  .cmd-group-header {
+    padding: 10px 14px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ls-color-fg-muted, #64748b);
+  }
+  .cmd-group-header:first-child { padding-top: 4px; }
 `;
 
 export class LSCommandPalette extends HTMLElement {
   #commands: PaletteCommand[] = [];
   #filtered: PaletteCommand[] = [];
+  #browsing = true;
   #selectedIndex = 0;
   #shadow: ShadowRoot;
   #input!: HTMLInputElement;
@@ -183,13 +190,14 @@ export class LSCommandPalette extends HTMLElement {
 
   #filter(query: string): void {
     const q = query.toLowerCase().trim();
-    this.#filtered = q
-      ? this.#commands.filter(
+    this.#browsing = q === "";
+    this.#filtered = this.#browsing
+      ? groupByCategory(this.#commands).flatMap((g) => g.items)
+      : this.#commands.filter(
           (c) =>
             c.label.toLowerCase().includes(q) ||
             (c.description ?? "").toLowerCase().includes(q)
-        )
-      : [...this.#commands];
+        );
     this.#selectedIndex = 0;
     this.#renderList();
   }
@@ -203,7 +211,15 @@ export class LSCommandPalette extends HTMLElement {
       this.#list.appendChild(hint);
       return;
     }
+    let lastCategory: CommandCategory | null = null;
     this.#filtered.forEach((cmd, i) => {
+      if (this.#browsing && cmd.category !== lastCategory) {
+        lastCategory = cmd.category;
+        const header = document.createElement("div");
+        header.className = "cmd-group-header";
+        header.textContent = CATEGORY_LABELS[cmd.category];
+        this.#list.appendChild(header);
+      }
       const item = document.createElement("div");
       item.className = "cmd-item" + (i === this.#selectedIndex ? " selected" : "");
       item.dataset["id"] = cmd.id;

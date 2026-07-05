@@ -1,13 +1,13 @@
 // E2E for the <ls-snippet> view (CodeMirror editor + preview + console +
 // network consent). Playwright CSS locators pierce the open shadow root, so we
 // can assert on the component's internals directly. The harness
-// (spike-snippet-view.html) default-mounts a snippet that declares
+// (tests/e2e/fixtures/snippet-view-harness.html) default-mounts a snippet that declares
 // connect-src https://api.github.com with no grant. See docs/snippets.md.
 import { test, expect } from "@playwright/test";
 
 test.describe("ls-snippet view", () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto("/spike-snippet-view.html");
+    await page.goto("/tests/e2e/fixtures/snippet-view-harness.html");
     await expect(page.locator("ls-snippet")).toBeVisible();
   });
 

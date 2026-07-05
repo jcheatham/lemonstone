@@ -1,9 +1,9 @@
-// DEV-ONLY manual verification harness for the snippet sandbox spike.
-// Served at /spike-snippet.html by `npm run dev`; NOT a build input, so it
-// never ships. Delete along with spike-snippet.html once the sandbox is wired
-// into the real editor. See docs/snippets.md.
+// E2E test fixture for the snippet sandbox (SnippetSandbox). Served at
+// /tests/e2e/fixtures/snippet-sandbox-harness.html by `npm run dev`; NOT a
+// build input, so it never ships. Driven by tests/e2e/snippet-sandbox.spec.ts.
+// See docs/snippets.md.
 
-import { SnippetSandbox } from "./snippet-sandbox.ts";
+import { SnippetSandbox } from "../../../src/snippet/snippet-sandbox.ts";
 
 // A "secret" on the top window + real storage, so the isolation probe has
 // something concrete to fail to reach.

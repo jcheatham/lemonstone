@@ -54,6 +54,8 @@ import type { LSSwitcher } from "./ls-switcher.ts";
 import type { LSEditor } from "./ls-editor.ts";
 import type { LSSearch } from "./ls-search.ts";
 import type { LSSnippet } from "./ls-snippet.ts";
+import type { CommandTarget } from "./command-types.ts";
+import { groupByCategory, CATEGORY_LABELS } from "./command-types.ts";
 
 // Config key for per-snippet network-access grants (local, per-vault, unsynced).
 const SNIPPET_GRANTS_KEY = "snippet:connect-grants";
@@ -168,6 +170,15 @@ const style = `
     color: var(--ls-color-fg-muted, #64748b);
     margin-top: 2px;
   }
+  .command-group-header {
+    padding: 10px 14px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ls-color-fg-muted, #64748b);
+  }
+  .command-group-header:first-child { padding-top: 4px; }
   #main {
     flex: 1;
     display: flex;
@@ -551,6 +562,14 @@ export class LSApp extends HTMLElement {
     this.#fileTree.addEventListener("file-rename", (e) => {
       const { oldPath, newPath } = (e as CustomEvent<{ oldPath: string; newPath: string }>).detail;
       this.#renameNote(oldPath, newPath);
+    });
+    this.#fileTree.addEventListener("folder-rename", (e) => {
+      const { oldPath, newPath } = (e as CustomEvent<{ oldPath: string; newPath: string }>).detail;
+      this.#moveFolderTo(oldPath, newPath).catch(console.error);
+    });
+    this.#fileTree.addEventListener("file-command", (e) => {
+      const { id, path, kind } = (e as CustomEvent<CommandTarget & { id: string }>).detail;
+      this.#onPaletteCommand(id, { path, kind });
     });
     this.#fileTree.addEventListener("zone-toggle", (e) => {
       const { prefix, unlocked } = (e as CustomEvent<{ prefix: string; unlocked: boolean }>).detail;
@@ -1306,9 +1325,14 @@ export class LSApp extends HTMLElement {
     return [...set].sort();
   }
 
-  async #pickFolder(placeholder: string, emptyHint = "No folders yet"): Promise<string | null> {
-    const folders = await this.#listFolders();
-    if (folders.length === 0) {
+  async #pickFolder(
+    placeholder: string,
+    emptyHint = "No folders yet",
+    opts?: { includeRoot?: boolean; exclude?: (folder: string) => boolean },
+  ): Promise<string | null> {
+    let folders = await this.#listFolders();
+    if (opts?.exclude) folders = folders.filter((f) => !opts.exclude!(f));
+    if (folders.length === 0 && !opts?.includeRoot) {
       getToast().show(emptyHint, "info", 3000);
       return null;
     }
@@ -1321,6 +1345,9 @@ export class LSApp extends HTMLElement {
         search: f,
       };
     });
+    if (opts?.includeRoot) {
+      items.unshift({ value: "", primary: "(vault root)", secondary: "", search: "" });
+    }
     return this.#switcher.pickItems(items, { placeholder, emptyHint });
   }
 
@@ -1364,11 +1391,32 @@ export class LSApp extends HTMLElement {
     navigateTo(path);
   }
 
-  async #renameFolder(): Promise<void> {
-    const oldFolder = await this.#pickFolder("Rename folder — pick current:");
+  async #renameFolder(initialFolder?: string): Promise<void> {
+    const oldFolder = initialFolder ?? await this.#pickFolder("Rename folder — pick current:");
     if (!oldFolder) return;
     const newFolder = this.#normalizeFolder(prompt(`Rename "${oldFolder}" to:`, oldFolder));
     if (!newFolder || newFolder === oldFolder) return;
+    await this.#moveFolderTo(oldFolder, newFolder);
+  }
+
+  /** Move a folder into a different parent, keeping its own leaf name. */
+  async #moveFolder(initialFolder?: string): Promise<void> {
+    const oldFolder = initialFolder ?? await this.#pickFolder("Move folder — pick one:");
+    if (!oldFolder) return;
+    const destFolder = await this.#pickFolder(
+      `Move "${oldFolder}" into — pick destination:`,
+      "No other folders to move into",
+      { includeRoot: true, exclude: (f) => f === oldFolder || f.startsWith(oldFolder + "/") },
+    );
+    if (destFolder === null) return;
+    const base = oldFolder.split("/").pop()!;
+    const newFolder = destFolder ? `${destFolder}/${base}` : base;
+    if (newFolder === oldFolder) return;
+    await this.#moveFolderTo(oldFolder, newFolder);
+  }
+
+  /** Batch-rename every file under `oldFolder/` to live under `newFolder/`. */
+  async #moveFolderTo(oldFolder: string, newFolder: string): Promise<void> {
     const oldPrefix = oldFolder + "/";
     const newPrefix = newFolder + "/";
 
@@ -1423,6 +1471,10 @@ export class LSApp extends HTMLElement {
   async #deleteFolder(): Promise<void> {
     const folder = await this.#pickFolder("Delete folder — pick one:");
     if (!folder) return;
+    await this.#deleteFolderAt(folder);
+  }
+
+  async #deleteFolderAt(folder: string): Promise<void> {
     const prefix = folder + "/";
     const entries = (await vaultService.list()).filter((e) => e.path.startsWith(prefix));
     if (entries.length === 0) {
@@ -2365,21 +2417,19 @@ export class LSApp extends HTMLElement {
       this.#setStatus("error", "No active note to move");
       return;
     }
-    const oldPath = this.#activePath;
-    const dot = oldPath.lastIndexOf(".");
-    const ext = dot >= 0 ? oldPath.slice(dot) : ".md";
-    const newPath = prompt(`Move to (full path, including ${ext}):`, oldPath);
-    if (!newPath || newPath === oldPath) return;
-    const normalized = newPath.endsWith(ext) ? newPath : `${newPath}${ext}`;
-    vaultService.rename(oldPath, normalized)
-      .then(async () => {
-        await this.#loadNoteList();
-        if (this.#activePath === oldPath) navigateTo(normalized);
-      })
-      .catch((err) => {
-        this.#setStatus("error", "Move failed");
-        console.error(err);
-      });
+    this.#moveFileTo(this.#activePath).catch(console.error);
+  }
+
+  /** Move a single file to a folder chosen via the switcher, keeping its name. */
+  async #moveFileTo(oldPath: string): Promise<void> {
+    const destFolder = await this.#pickFolder("Move to — pick destination:", "No folders yet", {
+      includeRoot: true,
+    });
+    if (destFolder === null) return;
+    const base = oldPath.split("/").pop()!;
+    const newPath = destFolder ? `${destFolder}/${base}` : base;
+    if (newPath === oldPath) return;
+    this.#renameNote(oldPath, newPath);
   }
 
   async #forcePull(): Promise<void> {
@@ -2452,13 +2502,16 @@ export class LSApp extends HTMLElement {
       this.#setStatus("error", "No active note to delete");
       return;
     }
-    if (!confirm(`Delete "${this.#activePath}"? This cannot be undone.`)) return;
-    const toDelete = this.#activePath;
+    await this.#deleteFileAt(this.#activePath);
+  }
+
+  async #deleteFileAt(path: string): Promise<void> {
+    if (!confirm(`Delete "${path}"? This cannot be undone.`)) return;
     try {
-      await vaultService.delete(toDelete);
-      await this.#removeSnippetGrant(toDelete);
+      await vaultService.delete(path);
+      await this.#removeSnippetGrant(path);
       await this.#loadNoteList();
-      navigateHome();
+      if (this.#activePath === path) navigateHome();
     } catch (err) {
       this.#setStatus("error", "Delete failed");
       console.error(err);
@@ -2512,36 +2565,39 @@ export class LSApp extends HTMLElement {
   // ── Command palette ───────────────────────────────────────────────────────
 
   #registerCommands(): void {
-    this.#palette.register({ id: "new-note", label: "New note", description: "Create a new note", shortcut: "Ctrl+N" });
-    this.#palette.register({ id: "new-canvas", label: "New canvas", description: "Create a new JSON Canvas file" });
-    this.#palette.register({ id: "new-snippet", label: "New snippet", description: "Create a new HTML/JS snippet" });
-    this.#palette.register({ id: "show-history", label: "Show recent commits", description: "List the last 30 commits on the current branch" });
-    this.#palette.register({ id: "new-folder", label: "New folder…", description: "Create a folder with a placeholder README" });
-    this.#palette.register({ id: "rename-folder", label: "Rename folder…", description: "Rename a folder and all files inside" });
-    this.#palette.register({ id: "delete-folder", label: "Delete folder…", description: "Delete a folder and everything inside it" });
-    this.#palette.register({ id: "canvas-edit-text", label: "Canvas: edit selected text node", description: "Enter edit mode on a selected text node (fallback for when double-click fails)" });
-    this.#palette.register({ id: "quick-open", label: "Quick open note", description: "Jump to a note by name", shortcut: "Ctrl+P" });
-    this.#palette.register({ id: "search", label: "Search notes", description: "Full-text search across vault", shortcut: "Ctrl+Shift+F" });
-    this.#palette.register({ id: "daily-today", label: "Open today's daily note", description: "Create or open today's daily note", shortcut: "Ctrl+D" });
-    this.#palette.register({ id: "daily-yesterday", label: "Open yesterday's daily note" });
-    this.#palette.register({ id: "daily-tomorrow", label: "Open tomorrow's daily note" });
-    this.#palette.register({ id: "move-note", label: "Move active note…", description: "Change the path of the currently-open note" });
-    this.#palette.register({ id: "delete-note", label: "Delete active note", description: "Delete the currently-open note" });
-    this.#palette.register({ id: "install-app", label: "Install Lemonstone", description: "Install as a PWA on this device" });
-    this.#palette.register({ id: "storage-quota", label: "Show storage quota", description: "How much browser storage the vault is using" });
-    this.#palette.register({ id: "force-pull", label: "Force pull from remote (discard local changes)", description: "Wipe local cache and re-download everything from GitHub" });
-    this.#palette.register({ id: "force-push", label: "Force push to remote (overwrite remote changes)", description: "Push local state to GitHub, discarding any commits that aren't in your local copy" });
-    this.#palette.register({ id: "encrypt-folder", label: "Encrypt folder…", description: "Create an encrypted zone at a folder; files inside are encrypted" });
-    this.#palette.register({ id: "decrypt-folder", label: "Decrypt folder…", description: "Remove an encryption zone; its files become plaintext" });
-    this.#palette.register({ id: "unlock-folder", label: "Unlock folder…", description: "Unwrap a locked encryption zone with its passphrase" });
-    this.#palette.register({ id: "lock-folder", label: "Lock folder…", description: "Drop one encryption zone's identity from memory" });
-    this.#palette.register({ id: "lock-all", label: "Lock all folders", description: "Drop every encryption zone identity from memory" });
-    this.#palette.register({ id: "list-zones", label: "List encryption zones", description: "Show every encrypted folder, its algorithm, and whether it's unlocked" });
-    this.#palette.register({ id: "go-home", label: "Go to home", description: "Show the welcome screen" });
-    this.#palette.register({ id: "sync", label: "Sync now", description: "Push and pull from GitHub" });
+    this.#palette.register({ id: "new-note", label: "New note", description: "Create a new note", shortcut: "Ctrl+N", category: "file" });
+    this.#palette.register({ id: "new-canvas", label: "New canvas", description: "Create a new JSON Canvas file", category: "file" });
+    this.#palette.register({ id: "new-snippet", label: "New snippet", description: "Create a new HTML/JS snippet", category: "file" });
+    this.#palette.register({ id: "move-note", label: "Move file…", description: "Move a file to a different folder", category: "file", isApplicable: (t) => t.kind !== "folder" });
+    this.#palette.register({ id: "delete-note", label: "Delete file", description: "Delete a file", category: "file", isApplicable: (t) => t.kind !== "folder" });
+    this.#palette.register({ id: "new-folder", label: "New folder…", description: "Create a folder with a placeholder README", category: "folder" });
+    this.#palette.register({ id: "rename-folder", label: "Rename folder…", description: "Rename a folder and all files inside", category: "folder", isApplicable: (t) => t.kind === "folder" });
+    this.#palette.register({ id: "move-folder", label: "Move folder…", description: "Move a folder (and everything inside it) to a different parent", category: "folder", isApplicable: (t) => t.kind === "folder" });
+    this.#palette.register({ id: "delete-folder", label: "Delete folder…", description: "Delete a folder and everything inside it", category: "folder", isApplicable: (t) => t.kind === "folder" });
+    this.#palette.register({ id: "encrypt-folder", label: "Encrypt folder…", description: "Create an encrypted zone at a folder; files inside are encrypted", category: "folder", isApplicable: (t) => t.kind === "folder" && !this.#zoneAtFolder(t.path) });
+    this.#palette.register({ id: "decrypt-folder", label: "Decrypt folder…", description: "Remove an encryption zone; its files become plaintext", category: "folder", isApplicable: (t) => t.kind === "folder" && !!this.#zoneAtFolder(t.path) });
+    this.#palette.register({ id: "unlock-folder", label: "Unlock folder…", description: "Unwrap a locked encryption zone with its passphrase", category: "folder", isApplicable: (t) => t.kind === "folder" && this.#zoneAtFolder(t.path)?.locked === true });
+    this.#palette.register({ id: "lock-folder", label: "Lock folder…", description: "Drop one encryption zone's identity from memory", category: "folder", isApplicable: (t) => t.kind === "folder" && this.#zoneAtFolder(t.path)?.locked === false });
+    this.#palette.register({ id: "canvas-edit-text", label: "Canvas: edit selected text node", description: "Enter edit mode on a selected text node (fallback for when double-click fails)", category: "canvas" });
+    this.#palette.register({ id: "quick-open", label: "Quick open note", description: "Jump to a note by name", shortcut: "Ctrl+P", category: "navigation" });
+    this.#palette.register({ id: "search", label: "Search notes", description: "Full-text search across vault", shortcut: "Ctrl+Shift+F", category: "navigation" });
+    this.#palette.register({ id: "daily-today", label: "Open today's daily note", description: "Create or open today's daily note", shortcut: "Ctrl+D", category: "navigation" });
+    this.#palette.register({ id: "daily-yesterday", label: "Open yesterday's daily note", category: "navigation" });
+    this.#palette.register({ id: "daily-tomorrow", label: "Open tomorrow's daily note", category: "navigation" });
+    this.#palette.register({ id: "go-home", label: "Go to home", description: "Show the welcome screen", category: "navigation" });
+    this.#palette.register({ id: "show-history", label: "Show recent commits", description: "List the last 30 commits on the current branch", category: "vault" });
+    this.#palette.register({ id: "sync", label: "Sync now", description: "Push and pull from GitHub", category: "vault" });
+    this.#palette.register({ id: "install-app", label: "Install Lemonstone", description: "Install as a PWA on this device", category: "global" });
+    this.#palette.register({ id: "storage-quota", label: "Show storage quota", description: "How much browser storage the vault is using", category: "vault" });
+    this.#palette.register({ id: "force-pull", label: "Force pull from remote (discard local changes)", description: "Wipe local cache and re-download everything from GitHub", category: "vault" });
+    this.#palette.register({ id: "force-push", label: "Force push to remote (overwrite remote changes)", description: "Push local state to GitHub, discarding any commits that aren't in your local copy", category: "vault" });
+    this.#palette.register({ id: "lock-all", label: "Lock all folders", description: "Drop every encryption zone identity from memory", category: "vault" });
+    this.#palette.register({ id: "list-zones", label: "List encryption zones", description: "Show every encrypted folder, its algorithm, and whether it's unlocked", category: "vault" });
 
     // Commands category panel mirrors the palette contents.
     this.#populateCommandsPanel();
+    // The context menu needs the same registry to filter by applicability.
+    this.#fileTree.commands = this.#palette.commands;
   }
 
   #populateCommandsPanel(): void {
@@ -2549,37 +2605,43 @@ export class LSApp extends HTMLElement {
     panel.replaceChildren();
     const list = document.createElement("div");
     list.className = "commands-list";
-    for (const cmd of this.#palette.commands) {
-      const row = document.createElement("button");
-      row.className = "command-row";
-      row.dataset["id"] = cmd.id;
+    for (const { category, items } of groupByCategory(this.#palette.commands)) {
+      const header = document.createElement("div");
+      header.className = "command-group-header";
+      header.textContent = CATEGORY_LABELS[category];
+      list.appendChild(header);
+      for (const cmd of items) {
+        const row = document.createElement("button");
+        row.className = "command-row";
+        row.dataset["id"] = cmd.id;
 
-      const main = document.createElement("div");
-      main.className = "command-main";
-      const label = document.createElement("span");
-      label.className = "command-label";
-      label.textContent = cmd.label;
-      main.appendChild(label);
-      if (cmd.shortcut) {
-        const short = document.createElement("span");
-        short.className = "command-shortcut";
-        short.textContent = cmd.shortcut;
-        main.appendChild(short);
+        const main = document.createElement("div");
+        main.className = "command-main";
+        const label = document.createElement("span");
+        label.className = "command-label";
+        label.textContent = cmd.label;
+        main.appendChild(label);
+        if (cmd.shortcut) {
+          const short = document.createElement("span");
+          short.className = "command-shortcut";
+          short.textContent = cmd.shortcut;
+          main.appendChild(short);
+        }
+        row.appendChild(main);
+        if (cmd.description) {
+          const desc = document.createElement("div");
+          desc.className = "command-desc";
+          desc.textContent = cmd.description;
+          row.appendChild(desc);
+        }
+        row.addEventListener("click", () => this.#onPaletteCommand(cmd.id));
+        list.appendChild(row);
       }
-      row.appendChild(main);
-      if (cmd.description) {
-        const desc = document.createElement("div");
-        desc.className = "command-desc";
-        desc.textContent = cmd.description;
-        row.appendChild(desc);
-      }
-      row.addEventListener("click", () => this.#onPaletteCommand(cmd.id));
-      list.appendChild(row);
     }
     panel.appendChild(list);
   }
 
-  #onPaletteCommand(id: string): void {
+  #onPaletteCommand(id: string, target?: CommandTarget): void {
     switch (id) {
       case "new-note":
         this.#newNote("").catch(console.error);
@@ -2594,10 +2656,13 @@ export class LSApp extends HTMLElement {
         this.#newFolder().catch(console.error);
         break;
       case "rename-folder":
-        this.#renameFolder().catch(console.error);
+        this.#renameFolder(target?.path).catch(console.error);
+        break;
+      case "move-folder":
+        this.#moveFolder(target?.path).catch(console.error);
         break;
       case "delete-folder":
-        this.#deleteFolder().catch(console.error);
+        target ? this.#deleteFolderAt(target.path).catch(console.error) : this.#deleteFolder().catch(console.error);
         break;
       case "show-history":
         this.#showHistory().catch(console.error);
@@ -2629,10 +2694,10 @@ export class LSApp extends HTMLElement {
         this.#openDailyNote(this.#dailyDateFor(1)).catch(console.error);
         break;
       case "move-note":
-        this.#moveActiveNote();
+        target ? this.#moveFileTo(target.path).catch(console.error) : this.#moveActiveNote();
         break;
       case "delete-note":
-        this.#deleteActiveNote();
+        target ? this.#deleteFileAt(target.path).catch(console.error) : this.#deleteActiveNote().catch(console.error);
         break;
       case "install-app":
         if (!canInstall()) {
@@ -2665,16 +2730,16 @@ export class LSApp extends HTMLElement {
         });
         break;
       case "encrypt-folder":
-        this.#promptEncryptFolder().catch(console.error);
+        target ? this.#encryptFolderAt(target.path) : this.#promptEncryptFolder().catch(console.error);
         break;
       case "decrypt-folder":
-        this.#promptDecryptFolder().catch(console.error);
+        target ? this.#decryptFolderAt(target.path).catch(console.error) : this.#promptDecryptFolder().catch(console.error);
         break;
       case "unlock-folder":
-        this.#promptUnlockFolder().catch(console.error);
+        target ? this.#unlockFolderAt(target.path) : this.#promptUnlockFolder().catch(console.error);
         break;
       case "lock-folder":
-        this.#promptLockFolder().catch(console.error);
+        target ? this.#lockFolderAt(target.path) : this.#promptLockFolder().catch(console.error);
         break;
       case "lock-all":
         vaultService.lockAll();
@@ -2686,12 +2751,22 @@ export class LSApp extends HTMLElement {
     }
   }
 
+  /** Looks up the encryption zone anchored exactly at `folder`, if any. */
+  #zoneAtFolder(folder: string): { id: string; prefix: string; locked: boolean } | undefined {
+    const z = vaultService.listZones().find((z) => z.prefix === folder + "/");
+    return z ? { id: z.id, prefix: z.prefix, locked: !vaultService.isZoneUnlocked(z.id) } : undefined;
+  }
+
   async #promptEncryptFolder(): Promise<void> {
     const folder = await this.#pickFolder(
       "Encrypt folder — pick one:",
       "No folders to encrypt yet",
     );
     if (!folder) return;
+    this.#encryptFolderAt(folder);
+  }
+
+  #encryptFolderAt(folder: string): void {
     const prefix = folder + "/";
     const existing = vaultService.listZones();
     if (existing.some((z) => z.prefix === prefix)) {
@@ -2720,6 +2795,15 @@ export class LSApp extends HTMLElement {
     if (!zoneId) return;
     const zone = zones.find((z) => z.id === zoneId);
     if (!zone) return;
+    await this.#decryptFolderAt(zone.prefix.slice(0, -1));
+  }
+
+  async #decryptFolderAt(folder: string): Promise<void> {
+    const zone = vaultService.listZones().find((z) => z.prefix === folder + "/");
+    if (!zone) {
+      getToast().show(`No encrypted zone at "${folder}".`, "info", 3000);
+      return;
+    }
     // An empty zone (its folder was deleted, or it never had files) has
     // nothing to re-encode, so it can be dropped without the passphrase.
     const hasRecords = await vaultService.zoneHasRecords(zone.id);
@@ -2774,6 +2858,19 @@ export class LSApp extends HTMLElement {
     if (!zoneId) return;
     const zone = locked.find((z) => z.id === zoneId);
     if (!zone) return;
+    this.#unlockFolderAt(zone.prefix.slice(0, -1));
+  }
+
+  #unlockFolderAt(folder: string): void {
+    const zone = this.#zoneAtFolder(folder);
+    if (!zone) {
+      getToast().show(`No encrypted zone at "${folder}".`, "info", 3000);
+      return;
+    }
+    if (!zone.locked) {
+      getToast().show(`"${folder}" is already unlocked.`, "info", 3000);
+      return;
+    }
     this.#unlockModal.setZone(zone.id, zone.prefix);
     this.#unlockModal.show();
   }
@@ -2796,6 +2893,19 @@ export class LSApp extends HTMLElement {
     if (!zoneId) return;
     const zone = unlocked.find((z) => z.id === zoneId);
     if (!zone) return;
+    this.#lockFolderAt(zone.prefix.slice(0, -1));
+  }
+
+  #lockFolderAt(folder: string): void {
+    const zone = this.#zoneAtFolder(folder);
+    if (!zone) {
+      getToast().show(`No encrypted zone at "${folder}".`, "info", 3000);
+      return;
+    }
+    if (zone.locked) {
+      getToast().show(`"${folder}" is already locked.`, "info", 3000);
+      return;
+    }
     vaultService.lockZone(zone.id);
     getToast().show(`"${zone.prefix}" locked.`, "info", 3000);
   }

@@ -709,6 +709,7 @@ Planned element catalog:
 | `<ls-calendar>` | Daily-notes calendar widget |
 | `<ls-toast>` | Non-blocking notifications |
 | `<ls-modal>` | Auth modals, conflict resolution, settings |
+| `<ls-context-menu>` | Anchored contextual command menu — desktop right-click, mobile "..." tap/long-press |
 
 ### 8.2 State Management
 

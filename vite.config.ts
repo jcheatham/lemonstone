@@ -134,8 +134,7 @@ export default defineConfig({
         main: "index.html",
         // NOTE: sandbox.html is intentionally NOT a Rollup HTML entry. It is
         // emitted by sandboxHostPlugin() with the host bundled as a classic
-        // inline script (opaque-origin module fetches are CORS-blocked). See
-        // docs/snippets.md.
+        // inline script (opaque-origin module fetches are CORS-blocked).
       },
     },
   },
