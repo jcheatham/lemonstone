@@ -57,6 +57,9 @@ import type { LSSnippet } from "./ls-snippet.ts";
 
 // Config key for per-snippet network-access grants (local, per-vault, unsynced).
 const SNIPPET_GRANTS_KEY = "snippet:connect-grants";
+// Config key for the snippet source editor's line-wrap preference (local,
+// per-vault, unsynced — applies to all snippets on this device).
+const SNIPPET_WRAP_KEY = "snippet:line-wrap";
 
 const style = `
   :host {
@@ -1474,16 +1477,18 @@ export class LSApp extends HTMLElement {
     if (!content && this.#pendingContent) content = this.#pendingContent;
     this.#pendingContent = "";
     const grants = await this.#snippetGrantsForPath(path);
-    this.#mountSnippet(path, content, grants);
+    const wrap = await this.#snippetWrapPref();
+    this.#mountSnippet(path, content, grants, wrap);
   }
 
-  #mountSnippet(path: string, content: string, grantedOrigins: string[]): void {
+  #mountSnippet(path: string, content: string, grantedOrigins: string[], wrap: boolean): void {
     this.#editorWrap.innerHTML = "";
     const view = document.createElement("ls-snippet") as LSSnippet;
     view.style.cssText = "display:flex;height:100%;width:100%;";
     view.path = path;
     view.value = content;
     view.grantedOrigins = grantedOrigins;
+    view.wrap = wrap;
     view.addEventListener("input", (e) => {
       const detail = (e as CustomEvent<{ content: string; path: string }>).detail;
       if (!detail || typeof detail.content !== "string") return;
@@ -1497,6 +1502,10 @@ export class LSApp extends HTMLElement {
           getToast().show(`Granted network access: ${origins.join(", ")}`, "success", 3000);
         })
         .catch(console.error);
+    });
+    view.addEventListener("snippet-wrap-change", (e) => {
+      const { wrap: next } = (e as CustomEvent<{ wrap: boolean }>).detail;
+      vaultService.setConfig(SNIPPET_WRAP_KEY, next).catch(console.error);
     });
     this.#editorWrap.appendChild(view);
     this.#editor = null;
@@ -1548,6 +1557,16 @@ export class LSApp extends HTMLElement {
     grants[newPath] = grants[oldPath]!;
     delete grants[oldPath];
     await vaultService.setConfig(SNIPPET_GRANTS_KEY, grants);
+  }
+
+  // ── Snippet line-wrap preference ────────────────────────────────────────────
+  // Local, device-wide toggle for the snippet source editor. Defaults to on
+  // (soft-wrap) since snippet source can have very long lines that are hard
+  // to read on narrow/mobile viewports without it.
+
+  async #snippetWrapPref(): Promise<boolean> {
+    const stored = await vaultService.getConfig<boolean>(SNIPPET_WRAP_KEY);
+    return stored ?? true;
   }
 
   #mountEditor(path: string, content: string): void {

@@ -6,7 +6,7 @@ import { html } from "@codemirror/lang-html";
 import { EditorView, keymap } from "@codemirror/view";
 import { defaultKeymap, indentWithTab } from "@codemirror/commands";
 import { indentUnit } from "@codemirror/language";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Compartment } from "@codemirror/state";
 import { lemonstoneTheme, lemonstoneHighlight } from "./theme.ts";
 import { obsidianDecorations } from "./obsidian-decorations.ts";
 import { wikilinkAutocomplete } from "./wikilink-autocomplete.ts";
@@ -48,6 +48,8 @@ export function createSnippetEditorExtensions(opts: {
   onDocChange: (content: string) => void;
   onRun: () => void;
   readonly?: boolean;
+  wrap: boolean;
+  wrapCompartment: Compartment;
 }) {
   return [
     basicSetup,
@@ -64,6 +66,9 @@ export function createSnippetEditorExtensions(opts: {
     EditorView.updateListener.of((update) => {
       if (update.docChanged) opts.onDocChange(update.state.doc.toString());
     }),
-    EditorView.lineWrapping,
+    // Wrapped by default (mobile-friendly); toggleable via the snippet
+    // toolbar for users who want to see real code structure + horizontal
+    // scroll instead. See ls-snippet.ts's Wrap button.
+    opts.wrapCompartment.of(opts.wrap ? EditorView.lineWrapping : []),
   ];
 }

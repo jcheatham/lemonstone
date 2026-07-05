@@ -12,7 +12,7 @@
 // ls-app's autosave pipeline persists edits. See docs/snippets.md.
 
 import { EditorView } from "@codemirror/view";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Compartment } from "@codemirror/state";
 import { createSnippetEditorExtensions } from "./codemirror/index.ts";
 import { SnippetSandbox, type SnippetDiagnostic, type SnippetConsoleEntry } from "../snippet/snippet-sandbox.ts";
 import { parseConnectSrc, originOf } from "../snippet/network-policy.ts";
@@ -47,6 +47,11 @@ template.innerHTML = `
     display: inline-flex; align-items: center; gap: 6px;
   }
   button.ghost:hover { color: var(--ls-color-fg, #e2e8f0); }
+  button.ghost.on {
+    color: var(--ls-color-fg, #e2e8f0);
+    border-color: var(--ls-color-accent, #6366f1);
+    background: rgba(99, 102, 241, 0.15);
+  }
   .badge { min-width: 16px; text-align: center; padding: 0 5px; border-radius: 8px;
     font-size: 11px; background: #3a1a1a; color: #f87171; display: none; }
   .badge.show { display: inline-block; }
@@ -99,8 +104,9 @@ template.innerHTML = `
     <button type="button" data-mode="preview">Preview</button>
   </span>
   <button type="button" class="action run">Run ▷</button>
-  <span class="hint">Edit, then Run (⌘⏎)</span>
+  <span class="hint">Edit, then Run</span>
   <span class="spacer"></span>
+  <button type="button" class="ghost toggle-wrap">Wrap</button>
   <button type="button" class="ghost toggle-console">Console <span class="badge">0</span></button>
 </div>
 <div class="consent">
@@ -135,6 +141,8 @@ export class LSSnippet extends HTMLElement {
 
   #path = "";
   #pendingValue = "";
+  #pendingWrap = true;
+  #wrapCompartment = new Compartment();
   #saveTimer: ReturnType<typeof setTimeout> | null = null;
 
   #entries: Entry[] = [];
@@ -156,6 +164,15 @@ export class LSSnippet extends HTMLElement {
     if (this.#view) this.#run();
   }
   get grantedOrigins(): string[] { return this.#grantedOrigins; }
+
+  /** Whether the source pane soft-wraps long lines. Loaded from device-local
+   *  config by ls-app; defaults to on (mobile-friendly). */
+  set wrap(v: boolean) {
+    this.#pendingWrap = v;
+    if (this.#view) this.#applyWrap(v);
+  }
+  get wrap(): boolean { return this.#pendingWrap; }
+
   set value(v: string) {
     if (!this.#view) { this.#pendingValue = v; return; }
     const cur = this.#view.state.doc.toString();
@@ -174,6 +191,8 @@ export class LSSnippet extends HTMLElement {
         extensions: createSnippetEditorExtensions({
           onDocChange: (c) => this.#onDocChange(c),
           onRun: () => this.#run(),
+          wrap: this.#pendingWrap,
+          wrapCompartment: this.#wrapCompartment,
         }),
       }),
       parent: this.#shadow.querySelector(".cm-host")!,
@@ -187,13 +206,25 @@ export class LSSnippet extends HTMLElement {
     });
 
     this.#wireControls();
+    this.#shadow.querySelector(".toggle-wrap")!.classList.toggle("on", this.#pendingWrap);
 
     this.#ro = new ResizeObserver((entries) => {
       const w = entries[0]?.contentRect.width ?? this.clientWidth;
       this.#setNarrow(w < NARROW_PX);
     });
     this.#ro.observe(this);
-    this.#setNarrow(this.clientWidth < NARROW_PX);
+
+    // On a narrow (mobile) viewport, open straight into Preview — that's
+    // almost always what you want to see first on a small screen. Only the
+    // initial mount defaults this way; later resizes keep whatever mode is
+    // already active instead of yanking the view around.
+    const narrow = this.clientWidth < NARROW_PX;
+    if (narrow) {
+      this.#mode = "preview";
+      this.#shadow.querySelectorAll<HTMLButtonElement>(".seg button").forEach((b) =>
+        b.classList.toggle("active", b.dataset["mode"] === "preview"));
+    }
+    this.#setNarrow(narrow);
 
     this.#run();
   }
@@ -216,6 +247,7 @@ export class LSSnippet extends HTMLElement {
     this.#shadow.querySelectorAll<HTMLButtonElement>(".seg button").forEach((btn) => {
       btn.addEventListener("click", () => this.#setMode(btn.dataset["mode"] as "source" | "preview"));
     });
+    this.#shadow.querySelector(".toggle-wrap")!.addEventListener("click", () => this.#toggleWrap());
     this.#shadow.querySelector(".toggle-console")!.addEventListener("click", () => this.#toggleConsole());
     this.#shadow.querySelector(".filter-all")!.addEventListener("click", () => this.#setFilter("all"));
     this.#shadow.querySelector(".filter-errors")!.addEventListener("click", () => this.#setFilter("errors"));
@@ -242,6 +274,22 @@ export class LSSnippet extends HTMLElement {
   #applyMode(): void {
     this.classList.toggle("show-source", this.#mode === "source");
     this.classList.toggle("show-preview", this.#mode === "preview");
+  }
+
+  #toggleWrap(): void {
+    this.#pendingWrap = !this.#pendingWrap;
+    this.#applyWrap(this.#pendingWrap);
+    this.#shadow.querySelector(".toggle-wrap")!.classList.toggle("on", this.#pendingWrap);
+    // ls-app persists the preference (device-local) for future snippet opens.
+    this.dispatchEvent(new CustomEvent("snippet-wrap-change", {
+      bubbles: true, composed: true, detail: { wrap: this.#pendingWrap },
+    }));
+  }
+
+  #applyWrap(wrap: boolean): void {
+    this.#view?.dispatch({
+      effects: this.#wrapCompartment.reconfigure(wrap ? EditorView.lineWrapping : []),
+    });
   }
 
   #run(): void {
