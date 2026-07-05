@@ -707,6 +707,7 @@ export class LSApp extends HTMLElement {
 
     // Show welcome screen initially
     this.#showWelcome();
+    this.#setSidebarPanelsVisible(false);
 
     // Status bar
     const statusBar = document.createElement("div");
@@ -966,7 +967,10 @@ export class LSApp extends HTMLElement {
     if (this.#activePath || this.#activeCommitOid) {
       this.#activeCommitOid = "";
       if (this.#activePath) navigateHome();
-      else this.#showWelcome();
+      else {
+        this.#showWelcome();
+        this.#setSidebarPanelsVisible(false);
+      }
     }
     // Unwinding past level 2 also clears any vault drill-in.
     this.#vaultDrillActive = false;
@@ -1042,7 +1046,9 @@ export class LSApp extends HTMLElement {
     this.#editor = null;
     requestAnimationFrame(() => canvas.focus());
 
-    // Canvas has no outline/backlinks today — clear the sidebar panels.
+    // A canvas has no heading structure, but other notes can still link to
+    // it, so keep backlinks and only hide the outline panel.
+    this.#setSidebarPanelsVisible(false, true);
     this.#outline.headings = [];
     this.#backlinks.path = path;
     this.#backlinks.links = vaultService.getBacklinks(path);
@@ -1118,6 +1124,7 @@ export class LSApp extends HTMLElement {
 
     this.#editorWrap.innerHTML = "";
     this.#editor = null;
+    this.#setSidebarPanelsVisible(false);
     this.#outline.headings = [];
     this.#backlinks.links = [];
     this.#conflictBanner.classList.remove("visible");
@@ -1494,7 +1501,9 @@ export class LSApp extends HTMLElement {
     this.#editorWrap.appendChild(view);
     this.#editor = null;
     this.#lastLoadedContent = content;
-    // Snippets have no outline/backlinks.
+    // Snippets are excluded from wikilink parsing and have no heading
+    // structure — outline/backlinks mean nothing here.
+    this.#setSidebarPanelsVisible(false);
     this.#outline.headings = [];
     this.#backlinks.path = path;
     this.#backlinks.links = [];
@@ -2033,6 +2042,7 @@ export class LSApp extends HTMLElement {
       this.#activePath = "";
       this.#showWelcome();
       this.#fileTree.activePath = "";
+      this.#setSidebarPanelsVisible(false);
       this.#outline.headings = [];
       this.#backlinks.links = [];
       this.#conflictBanner.classList.remove("visible");
@@ -2065,6 +2075,7 @@ export class LSApp extends HTMLElement {
       this.#activePath = "";
       this.#showWelcome();
       this.#fileTree.activePath = "";
+      this.#setSidebarPanelsVisible(false);
       this.#outline.headings = [];
       this.#backlinks.links = [];
       this.#conflictBanner.classList.remove("visible");
@@ -2197,7 +2208,8 @@ export class LSApp extends HTMLElement {
       : "This file is in an encrypted folder. Enter the passphrase to read it.";
     placeholder.append(title, sub);
     this.#editorWrap.appendChild(placeholder);
-    // Clear sidebar panels since we can't parse locked content.
+    // Can't parse locked content, so hide the panels rather than clear them.
+    this.#setSidebarPanelsVisible(false);
     this.#outline.headings = [];
     this.#backlinks.path = path;
     this.#backlinks.links = [];
@@ -2222,10 +2234,19 @@ export class LSApp extends HTMLElement {
   }
 
   #updateSidebarPanels(path: string, content: string): void {
+    this.#setSidebarPanelsVisible(true);
     this.#outline.headings = parseHeadings(content);
     this.#backlinks.path = path;
     const incoming = vaultService.getBacklinks(path);
     this.#backlinks.links = incoming;
+  }
+
+  /** Outline/backlinks only make sense for a live markdown note. Hide either
+   *  panel (canvas, snippets, locked/commit/no-file views) instead of showing
+   *  an empty "No headings" / "No incoming links" state that means nothing. */
+  #setSidebarPanelsVisible(outline: boolean, backlinks: boolean = outline): void {
+    this.#outline.style.display = outline ? "" : "none";
+    this.#backlinks.style.display = backlinks ? "" : "none";
   }
 
   // ── Editor input → save ───────────────────────────────────────────────────
