@@ -32,13 +32,20 @@ const commands: PaletteCommand[] = [
 ];
 tree.commands = commands;
 
+tree.repoInfo = {
+  repoFullName: "jcheatham/notes",
+  sha: "4a5765e1234567890abcdef1234567890abcdef",
+  commitDate: Date.now() - 3 * 60_000,
+  commitMessage: "Fix typo in daily note template",
+};
+
 (window as unknown as { __tree: LSFileTree }).__tree = tree;
 
 const log = document.createElement("div");
 log.id = "log";
 log.style.cssText = "position:fixed;bottom:0;left:0;right:0;background:#000;color:#0f0;font:11px monospace;padding:4px;max-height:120px;overflow:auto;";
 document.body.appendChild(log);
-for (const evt of ["file-command", "folder-rename", "file-rename", "file-open", "file-new"]) {
+for (const evt of ["file-command", "folder-rename", "file-rename", "file-open", "file-new", "repo-history"]) {
   tree.addEventListener(evt, (e) => {
     const line = document.createElement("div");
     line.textContent = `${evt}: ${JSON.stringify((e as CustomEvent).detail)}`;

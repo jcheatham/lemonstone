@@ -5,7 +5,7 @@
 //   <ls-command-palette>, <ls-switcher>, hash router, vaultService.
 
 import { vaultService, multiplexer } from "../vault/index.ts";
-import { MANIFEST_DB_NAME } from "../vault/manifest.ts";
+import { MANIFEST_DB_NAME, type VaultRecord } from "../vault/manifest.ts";
 import type { AuthPayload } from "../storage/schema.ts";
 import { currentRoute, navigateTo, navigateHome, navigateToVault, navigateToVaults } from "./router.ts";
 import type { Route } from "./router.ts";
@@ -56,6 +56,7 @@ import type { LSSearch } from "./ls-search.ts";
 import type { LSSnippet } from "./ls-snippet.ts";
 import type { CommandTarget } from "./command-types.ts";
 import { groupByCategory, CATEGORY_LABELS } from "./command-types.ts";
+import { formatClockTime } from "./format-time.ts";
 
 // Config key for per-snippet network-access grants (local, per-vault, unsynced).
 const SNIPPET_GRANTS_KEY = "snippet:connect-grants";
@@ -336,20 +337,6 @@ const style = `
  * Supports both the current nested layout (daily/YYYY/MM/DD/events.md) and
  * the legacy flat layout (daily/YYYY-MM-DD.md).
  */
-/** Coarse relative-time label ("just now", "3m ago", "2h ago", "yesterday"). */
-function formatAgo(ms: number): string {
-  if (ms < 30_000) return "just now";
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  if (d === 1) return "yesterday";
-  return `${d}d ago`;
-}
-
 function dailyDateFromPath(path: string, dailyFolder: string): string | null {
   const prefix = dailyFolder ? `${dailyFolder}/` : "";
   if (!path.startsWith(prefix)) return null;
@@ -399,7 +386,6 @@ export class LSApp extends HTMLElement {
   #editorWrap!: HTMLElement;
   #statusDot!: HTMLElement;
   #statusText!: HTMLElement;
-  #repoLabel!: HTMLElement;
   #conflictBanner!: HTMLElement;
   #fileTree!: LSFileTree;
   #backlinks!: LSBacklinks;
@@ -430,7 +416,7 @@ export class LSApp extends HTMLElement {
   #vaultDrillActive = false;
   /** Last-known vaults list. Populated by #refreshVaultsList so sync
    *  handlers (like vault-select) can look up a record without awaiting. */
-  #cachedVaults: { id: string; label: string; repoFullName: string; repoDefaultBranch: string; createdAt: number; lastOpenedAt: number }[] = [];
+  #cachedVaults: VaultRecord[] = [];
   #authModal!: LSModal;
   #unlockModal!: LSUnlockModal;
   #encryptFolderModal!: LSEncryptFolderModal;
@@ -575,6 +561,7 @@ export class LSApp extends HTMLElement {
       const { prefix, unlocked } = (e as CustomEvent<{ prefix: string; unlocked: boolean }>).detail;
       this.#toggleZone(prefix, unlocked);
     });
+    this.#fileTree.addEventListener("repo-history", () => this.#drillInto("history"));
     filesTop.appendChild(this.#fileTree);
     filesPanel.appendChild(filesTop);
 
@@ -742,19 +729,17 @@ export class LSApp extends HTMLElement {
       "color:var(--ls-color-fg-muted,#64748b);font-size:11px;text-decoration:none;" +
       "font-family:var(--ls-font-mono,monospace);white-space:nowrap;";
 
-    this.#repoLabel = document.createElement("span");
-    this.#repoLabel.style.cssText =
-      `margin-left:auto;${mutedLinkCss}overflow:hidden;text-overflow:ellipsis;max-width:260px;`;
-
+    // The repo/sha identity now lives in the file-tree header (see
+    // #renderRepoInfo); the status bar's job is purely the freshness clock.
     const signOutBtn = document.createElement("button");
     signOutBtn.textContent = "Sign out";
     signOutBtn.style.cssText =
-      "margin-left:8px;background:none;border:none;color:var(--ls-color-fg-muted,#64748b);" +
+      "margin-left:auto;background:none;border:none;color:var(--ls-color-fg-muted,#64748b);" +
       "font-size:11px;font-family:inherit;cursor:pointer;padding:0 4px;flex-shrink:0;";
     signOutBtn.addEventListener("mouseenter", () => { signOutBtn.style.color = "var(--ls-color-fg,#e0e0e0)"; });
     signOutBtn.addEventListener("mouseleave", () => { signOutBtn.style.color = "var(--ls-color-fg-muted,#64748b)"; });
     signOutBtn.addEventListener("click", () => this.#signOut());
-    statusBar.append(this.#statusDot, this.#statusText, this.#repoLabel, signOutBtn);
+    statusBar.append(this.#statusDot, this.#statusText, signOutBtn);
 
     // Build label lives at the bottom of the category picker via a named
     // slot on ls-category-nav. Projected from this (the app) as light-DOM
@@ -1124,6 +1109,11 @@ export class LSApp extends HTMLElement {
       const commits = await vaultService.recentCommits(50);
       this.#history.commits = commits as CommitSummary[];
       this.#history.activeOid = this.#activeCommitOid;
+      // commits[0] is HEAD (recentCommits returns reverse-chrono) — piggyback
+      // on this already-fetched data to date the repo label's sha, rather
+      // than making a second round-trip just for that.
+      const head = commits[0];
+      if (head) this.#setCommitInfo(head.oid, head.date, head.message);
     } catch (err) {
       console.error(err);
     }
@@ -1685,46 +1675,50 @@ export class LSApp extends HTMLElement {
 
   #currentRepo = "";
   #currentSha = "";
+  // Commit metadata for #currentSha, filled in (best-effort, no extra
+  // round-trip) once #loadHistory's recentCommits() call resolves. Null
+  // until then, or if the fetch failed — the sha still renders without it.
+  // Also drives the status bar's "Written at …" clock (see #renderStatusText).
+  #currentCommitDate: number | null = null;
+  #currentCommitMessage = "";
 
-  #renderRepoLabel(): void {
-    this.#repoLabel.replaceChildren();
-    if (!this.#currentRepo) return;
-
-    const repoLink = document.createElement("a");
-    repoLink.textContent = this.#currentRepo;
-    repoLink.href = `https://github.com/${this.#currentRepo}`;
-    repoLink.target = "_blank";
-    repoLink.rel = "noopener noreferrer";
-    repoLink.style.cssText = "color:inherit;text-decoration:none;";
-    this.#repoLabel.appendChild(repoLink);
-
-    if (this.#currentSha) {
-      const sep = document.createTextNode("#");
-      const shaLink = document.createElement("a");
-      shaLink.textContent = this.#currentSha.slice(0, 7);
-      // Local navigation — drill into the History category instead of popping
-      // a new tab at GitHub. The user almost always wants "what changed
-      // recently" rather than the static GitHub commit view.
-      shaLink.href = "#";
-      shaLink.title = "Last synced commit — open History";
-      shaLink.style.cssText = "color:inherit;text-decoration:none;cursor:pointer;";
-      shaLink.addEventListener("click", (e) => {
-        e.preventDefault();
-        this.#drillInto("history");
-      });
-      this.#repoLabel.append(sep, shaLink);
-    }
+  /** Pushes the repo/sha/commit state into the file-tree header, which owns
+   *  the actual rendering (link, tooltip, click-to-open-History). */
+  #renderRepoInfo(): void {
+    this.#fileTree.repoInfo = this.#currentRepo
+      ? {
+          repoFullName: this.#currentRepo,
+          sha: this.#currentSha,
+          commitDate: this.#currentCommitDate,
+          commitMessage: this.#currentCommitMessage,
+        }
+      : null;
   }
 
   #setRepoLabel(repoFullName: string): void {
     this.#currentRepo = repoFullName;
-    this.#renderRepoLabel();
+    this.#renderRepoInfo();
   }
 
   #setRepoSha(headOid: string): void {
     if (!headOid || headOid === this.#currentSha) return;
     this.#currentSha = headOid;
-    this.#renderRepoLabel();
+    // Stale commit metadata belongs to the old sha — drop it until the next
+    // #loadHistory() confirms the new one.
+    this.#currentCommitDate = null;
+    this.#currentCommitMessage = "";
+    this.#renderRepoInfo();
+  }
+
+  /** Best-effort commit metadata for the header's age suffix and the status
+   *  bar's "Written at …" clock — ignored if `oid` no longer matches
+   *  #currentSha (a newer sync landed in the meantime). */
+  #setCommitInfo(oid: string, date: number, message: string): void {
+    if (oid !== this.#currentSha) return;
+    this.#currentCommitDate = date;
+    this.#currentCommitMessage = message;
+    this.#renderRepoInfo();
+    this.#renderStatusText();
   }
 
   /** Called after a shared-link accept modal yields a decrypted payload.
@@ -1856,8 +1850,12 @@ export class LSApp extends HTMLElement {
       const cur = multiplexer.currentVault;
       if (cur) {
         this.#setRepoLabel(cur.repoFullName);
+        // New vault, stale sha — clear its commit metadata too, not just the
+        // sha text, so the header doesn't show the old vault's commit age.
         this.#currentSha = "";
-        this.#renderRepoLabel();
+        this.#currentCommitDate = null;
+        this.#currentCommitMessage = "";
+        this.#renderRepoInfo();
       } else {
         this.#setRepoLabel("");
       }
@@ -1903,7 +1901,7 @@ export class LSApp extends HTMLElement {
     });
 
     vaultService.addEventListener("vault:synced", (e) => {
-      this.#setStatus("ok", "Synced");
+      this.#setStatus("ok", this.#formatStatusClock());
       const headOid = (e as CustomEvent).detail?.headOid as string | undefined;
       if (headOid) this.#setRepoSha(headOid);
       // Refresh the file list — catches remote adds/removes that don't emit
@@ -1943,7 +1941,7 @@ export class LSApp extends HTMLElement {
     vaultService.addEventListener("vault:synced", () => {
       setTimeout(() => {
         if (this.#statusDot.classList.contains("syncing")) {
-          this.#setStatus("ok", "Synced");
+          this.#setStatus("ok", this.#formatStatusClock());
         }
       }, 200);
     });
@@ -1969,27 +1967,48 @@ export class LSApp extends HTMLElement {
     this.#renderStatusText();
   }
 
-  #renderStatusText(): void {
-    const now = Date.now();
+  /** Two absolute clock readings, not relative "Xm ago" labels — a fixed
+   *  clock-face reading lets the user do their own freshness math instead of
+   *  trusting a phrase that goes stale between re-renders:
+   *   - "Synced" — last time this device completed a round-trip to GitHub
+   *     (can be recent even when nothing changed, or a no-op).
+   *   - "Written" — the current commit's own authored timestamp, i.e. content
+   *     freshness. The repo/sha header (see #renderRepoInfo) identifies WHAT
+   *     commit that is; this is WHEN it was written.
+   *  Falls back to "Ready" until at least one of the two is known. */
+  #formatStatusClock(): string {
     // `vaultService` is a Proxy over the current VaultService; reading any
     // property on it before a vault is open throws. Guard every access.
-    const last = multiplexer.currentVault ? multiplexer.currentVault.lastSyncAt : null;
-    this.#statusText.title = last
-      ? `Last synced at ${new Date(last).toLocaleString()}`
-      : "Not synced yet this session";
+    const lastChecked = multiplexer.currentVault ? multiplexer.currentVault.lastSyncAt : null;
+    const commitDate = this.#currentCommitDate;
+    const parts: string[] = [];
+    if (lastChecked) parts.push(`Synced ${formatClockTime(lastChecked)}`);
+    if (commitDate) parts.push(`Written ${formatClockTime(commitDate)}`);
+    return parts.length ? parts.join(" · ") : "Ready";
+  }
+
+  #renderStatusText(): void {
+    const now = Date.now();
+    const lastChecked = multiplexer.currentVault ? multiplexer.currentVault.lastSyncAt : null;
+    const tooltipParts: string[] = [];
+    if (this.#currentCommitMessage) tooltipParts.push(`"${this.#currentCommitMessage}"`);
+    if (lastChecked) tooltipParts.push(`Checked GitHub: ${new Date(lastChecked).toLocaleString()}`);
+    if (this.#currentCommitDate) tooltipParts.push(`Commit written: ${new Date(this.#currentCommitDate).toLocaleString()}`);
+    this.#statusText.title = tooltipParts.length ? tooltipParts.join(" — ") : "Not synced yet";
     const transientActive = this.#statusTransientText && (this.#statusTransientUntil === 0 || now < this.#statusTransientUntil);
     if (transientActive) {
       this.#statusText.textContent = this.#statusTransientText;
       return;
     }
-    // Idle: show relative last-sync time. Falls through to "Ready" only until
-    // the first sync completes.
-    this.#statusText.textContent = last ? `Synced ${formatAgo(now - last)}` : "Ready";
+    this.#statusText.textContent = this.#formatStatusClock();
   }
 
   #startStatusTicker(): void {
-    // One timer, runs forever. 15s granularity is fine for "3m ago" labels
-    // and cheap enough not to matter on mobile.
+    // One timer, runs forever. The status text itself is now two absolute
+    // clock readings (they don't go stale), but re-rendering still fades
+    // transient "ok" messages like "Saved"/"Restored" back to the idle
+    // "Synced … · Written …" text once their 3.5s window lapses. 15s
+    // granularity is cheap enough not to matter on mobile.
     setInterval(() => this.#renderStatusText(), 15_000);
   }
 
@@ -2031,8 +2050,11 @@ export class LSApp extends HTMLElement {
     const snapshot: VaultDetailSnapshot = {
       record,
       isCurrent,
-      // lastSyncAt + zone stats only available for the active vault in memory.
-      lastSyncAt: isCurrent && current ? current.lastSyncAt : null,
+      // The active vault's in-memory clock is authoritative (it can be more
+      // current than the last manifest write); other vaults fall back to
+      // their persisted lastSyncedAt, which is now accurate across sessions.
+      lastSyncAt: isCurrent && current ? current.lastSyncAt : (record.lastSyncedAt ?? null),
+      // Zone stats stay memory-only — only meaningful for the open vault.
       zoneCount: isCurrent && current ? current.listZones().length : 0,
       lockedZoneCount: isCurrent && current
         ? current.listZones().filter((z) => !current.isZoneUnlocked(z.id)).length
@@ -2444,7 +2466,7 @@ export class LSApp extends HTMLElement {
       await vaultService.forcePull();
       await this.#loadNoteList();
       navigateHome();
-      this.#setStatus("ok", "Synced");
+      this.#setStatus("ok", this.#formatStatusClock());
       getToast().show("Local vault reset to match remote.", "success", 4000);
     } catch (err) {
       this.#setStatus("error", "Force pull failed");
@@ -2462,7 +2484,7 @@ export class LSApp extends HTMLElement {
     this.#setStatus("syncing", "Force-pushing…");
     try {
       await vaultService.forcePush();
-      this.#setStatus("ok", "Synced");
+      this.#setStatus("ok", this.#formatStatusClock());
       getToast().show("Remote overwritten with local state.", "success", 4000);
     } catch (err) {
       this.#setStatus("error", "Force push failed");

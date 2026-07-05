@@ -14,6 +14,10 @@ export interface VaultRecord {
   repoDefaultBranch: string;
   createdAt: number;
   lastOpenedAt: number;
+  /** Wall-clock time of this vault's last successful sync round-trip, across
+   *  all sessions — null if it's never completed one. Records written before
+   *  this field existed won't have it; treat missing as null. */
+  lastSyncedAt: number | null;
 }
 
 interface MetaRecord {
@@ -90,6 +94,12 @@ export async function touchVaultOpened(id: string): Promise<void> {
   const existing = await getVault(id);
   if (!existing) return;
   await putVault({ ...existing, lastOpenedAt: Date.now() });
+}
+
+export async function touchVaultSynced(id: string, at = Date.now()): Promise<void> {
+  const existing = await getVault(id);
+  if (!existing) return;
+  await putVault({ ...existing, lastSyncedAt: at });
 }
 
 // ── Current-vault pointer ──────────────────────────────────────────────────

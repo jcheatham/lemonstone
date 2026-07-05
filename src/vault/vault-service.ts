@@ -41,6 +41,9 @@ export interface VaultServiceConfig {
   readonly opfsDir: string;
   readonly repoFullName: string;
   readonly repoDefaultBranch: string;
+  /** Persisted last-sync time to seed the in-memory clock with, so a fresh
+   *  page load doesn't show "not synced" until the next sync completes. */
+  readonly lastSyncedAt?: number | null;
 }
 
 export class VaultService extends EventTarget {
@@ -55,6 +58,7 @@ export class VaultService extends EventTarget {
     this.zoneService = new ZoneService();
     this.storage = new StorageAdapter(this.zoneService, config.dbName);
     this.syncClient = new SyncClient(config.vaultId);
+    this.#lastSyncAt = config.lastSyncedAt ?? null;
   }
 
   get vaultId(): string { return this.config.vaultId; }
@@ -253,8 +257,9 @@ export class VaultService extends EventTarget {
     });
   }
 
-  // Timestamp of the last sync that returned a non-empty head OID. Null until
-  // the first successful sync completes in this session.
+  // Timestamp of the last successful sync round-trip (talked to GitHub,
+  // whether or not anything changed). Seeded from the persisted manifest
+  // record in the constructor; null only if this vault has never synced.
   #lastSyncAt: number | null = null;
 
   get lastSyncAt(): number | null { return this.#lastSyncAt; }

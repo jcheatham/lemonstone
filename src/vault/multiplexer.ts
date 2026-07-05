@@ -15,6 +15,7 @@ import {
   removeVaultRecord,
   setCurrentVaultId,
   touchVaultOpened,
+  touchVaultSynced,
   type VaultRecord,
 } from "./manifest.ts";
 import { saveTokens } from "../auth/token-store.ts";
@@ -117,6 +118,7 @@ export class VaultMultiplexer extends EventTarget {
       repoDefaultBranch: tokens.repoDefaultBranch,
       createdAt: Date.now(),
       lastOpenedAt: Date.now(),
+      lastSyncedAt: null,
     };
     // Stash the auth payload into the brand-new vault's auth store.
     await saveTokens(dbNameFor(id), tokens);
@@ -181,6 +183,10 @@ export class VaultMultiplexer extends EventTarget {
         opfsDir: opfsDirFor(record.id),
         repoFullName: record.repoFullName,
         repoDefaultBranch: record.repoDefaultBranch,
+        // Seed from the persisted record so a fresh reload/vault-switch shows
+        // an accurate "Synced Xh ago" immediately instead of resetting to
+        // null until the next sync completes this session.
+        lastSyncedAt: record.lastSyncedAt ?? null,
       };
 
       // Prime the worker-side engine so its `sync`/`clone` ops can route.
@@ -251,8 +257,17 @@ export class VaultMultiplexer extends EventTarget {
       service.addEventListener(type, fn);
       return { type, fn };
     });
+    // Persist "last synced" to the manifest so it survives reloads and is
+    // visible for vaults that aren't the current one (see VaultDetailSnapshot).
+    const onSynced = (): void => {
+      touchVaultSynced(service.vaultId).catch((err) =>
+        console.warn("[mux] touchVaultSynced failed:", err),
+      );
+    };
+    service.addEventListener("vault:synced", onSynced);
     this.#forwardingCleanup = () => {
       for (const { type, fn } of handlers) service.removeEventListener(type, fn);
+      service.removeEventListener("vault:synced", onSynced);
     };
   }
 }

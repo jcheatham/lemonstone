@@ -6,6 +6,8 @@
 //   zones — { prefix, unlocked }[] for rendering lock glyphs on encrypted folders
 //   commands — readonly PaletteCommand[] — the app's command registry, used to
 //     populate the right-click/"..." context menu with applicable commands
+//   repoInfo — RepoInfo | null — repo/sha identity shown in the header in
+//     place of the static "Notes" label once a vault is connected
 //
 // Events (bubbles, composed):
 //   file-open     — detail: { path: string }
@@ -14,6 +16,7 @@
 //   folder-rename — detail: { oldPath: string; newPath: string } — folder renamed/moved via its own inline edit
 //   file-command  — detail: { id: string; path: string; kind: TargetKind } — a registry command chosen from the context menu
 //   zone-toggle   — detail: { prefix: string; unlocked: boolean } — user clicked the lock badge
+//   repo-history  — user clicked the commit sha in the header; open History
 //
 // The header's "+" button opens a small menu for creating at the vault root.
 // Per-folder creation lives in the "Create" group of that folder's context
@@ -54,8 +57,23 @@ const style = `
     line-height: 1;
     padding: 0 2px;
     border-radius: 3px;
+    flex-shrink: 0;
   }
   .tree-header button:hover { color: var(--ls-color-fg, #e0e0e0); background: rgba(255,255,255,0.07); }
+  .tree-header-label {
+    /* Overrides the header's uppercase/letter-spacing — fine for a static
+       "NOTES" section label, unreadable for a repo name + commit sha. */
+    text-transform: none;
+    letter-spacing: normal;
+    font-family: var(--ls-font-mono, monospace);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1;
+  }
+  .tree-header-label a { color: inherit; text-decoration: none; }
+  .tree-header-label a.sha { cursor: pointer; }
   .tree-scroll {
     flex: 1;
     overflow-y: auto;
@@ -248,12 +266,23 @@ export interface ZoneInfo {
   unlocked: boolean;
 }
 
+export interface RepoInfo {
+  repoFullName: string;
+  /** Full commit sha the vault is currently synced to. */
+  sha: string;
+  /** Commit's authored timestamp (ms), or null if not yet known. */
+  commitDate: number | null;
+  commitMessage: string;
+}
+
 export class LSFileTree extends HTMLElement {
   #notes: string[] = [];
   #activePath = "";
   #collapsedFolders = new Set<string>();
   #zones: ZoneInfo[] = [];
   #commands: readonly PaletteCommand[] = [];
+  #repoInfo: RepoInfo | null = null;
+  #headerLabelEl: HTMLElement | null = null;
   #shadow: ShadowRoot;
   #menu!: HTMLElement;
   #menuFolder = "";
@@ -468,6 +497,15 @@ export class LSFileTree extends HTMLElement {
     if (!this.#inlineActive) this.#render();
   }
 
+  get repoInfo(): RepoInfo | null { return this.#repoInfo; }
+  set repoInfo(v: RepoInfo | null) {
+    this.#repoInfo = v;
+    // Targeted update, not a full #render() — this can fire mid-sync
+    // (repeatedly, as commit metadata arrives) and shouldn't disturb an
+    // in-progress inline rename/create or the tree's scroll position.
+    this.#renderHeaderLabel();
+  }
+
   /** Which zone, if any, is rooted exactly at this folder. */
   #zoneAtFolder(folder: string): ZoneInfo | undefined {
     const prefix = folder + "/";
@@ -499,6 +537,50 @@ export class LSFileTree extends HTMLElement {
     return btn;
   }
 
+  /** Renders the header's label: "Notes" until a vault is connected, then the
+   *  repo + commit sha (clickable to open History), replacing the static
+   *  section title with the vault's identity. */
+  #renderHeaderLabel(): void {
+    const label = this.#headerLabelEl;
+    if (!label) return;
+    label.replaceChildren();
+
+    if (!this.#repoInfo) {
+      label.textContent = "Notes";
+      return;
+    }
+    const { repoFullName, sha, commitDate, commitMessage } = this.#repoInfo;
+
+    const repoLink = document.createElement("a");
+    repoLink.textContent = repoFullName;
+    repoLink.href = `https://github.com/${repoFullName}`;
+    repoLink.target = "_blank";
+    repoLink.rel = "noopener noreferrer";
+    label.appendChild(repoLink);
+
+    if (!sha) return;
+    label.append("#");
+    const shaLink = document.createElement("a");
+    shaLink.className = "sha";
+    shaLink.href = "#";
+    shaLink.textContent = sha.slice(0, 7);
+    // Age lives in the status bar's "Written at …" clock, not here — this is
+    // just the identity (what commit), not a freshness claim.
+    if (commitDate) {
+      const absolute = new Date(commitDate).toLocaleString();
+      shaLink.title = commitMessage
+        ? `"${commitMessage}" — ${absolute} — open History`
+        : `Committed ${absolute} — open History`;
+    } else {
+      shaLink.title = "Last synced commit — open History";
+    }
+    shaLink.addEventListener("click", (e) => {
+      e.preventDefault();
+      this.dispatchEvent(new CustomEvent("repo-history", { bubbles: true, composed: true }));
+    });
+    label.appendChild(shaLink);
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   #render(): void {
@@ -513,7 +595,11 @@ export class LSFileTree extends HTMLElement {
     // Header
     const header = document.createElement("div");
     header.className = "tree-header";
-    header.textContent = "Notes";
+    const label = document.createElement("span");
+    label.className = "tree-header-label";
+    header.appendChild(label);
+    this.#headerLabelEl = label;
+    this.#renderHeaderLabel();
     const newBtn = document.createElement("button");
     newBtn.title = "New note, canvas, or folder";
     newBtn.textContent = "+";

@@ -118,6 +118,39 @@ test.describe("ls-file-tree context menu", () => {
   });
 });
 
+test.describe("ls-file-tree header repo/sha", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/tests/e2e/fixtures/file-tree-harness.html");
+    await expect(page.locator("ls-file-tree")).toBeVisible();
+  });
+
+  test("shows the repo and short sha instead of a static 'Notes' label", async ({ page }) => {
+    const label = page.locator("ls-file-tree .tree-header-label");
+    await expect(label).toHaveText("jcheatham/notes#4a5765e");
+  });
+
+  test("puts the commit's date/message in the sha's tooltip, not the visible label", async ({ page }) => {
+    const sha = page.locator("ls-file-tree .tree-header-label a.sha");
+    await expect(sha).toHaveAttribute("title", /Fix typo in daily note template/);
+  });
+
+  test("clicking the sha dispatches repo-history instead of navigating", async ({ page }) => {
+    await page.locator("ls-file-tree .tree-header-label a.sha").click();
+    await expect(page.locator("#log")).toContainText("repo-history:");
+    // The click was on an in-page anchor with href="#" — confirm it didn't
+    // actually navigate (preventDefault worked).
+    expect(new URL(page.url()).pathname).toBe("/tests/e2e/fixtures/file-tree-harness.html");
+  });
+
+  test("falls back to a plain 'Notes' label when no vault is connected", async ({ page }) => {
+    await page.evaluate(() => {
+      const tree = document.querySelector("ls-file-tree") as HTMLElement & { repoInfo: unknown };
+      tree.repoInfo = null;
+    });
+    await expect(page.locator("ls-file-tree .tree-header-label")).toHaveText("Notes");
+  });
+});
+
 test.describe("ls-file-tree drag-to-move", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/tests/e2e/fixtures/file-tree-harness.html");

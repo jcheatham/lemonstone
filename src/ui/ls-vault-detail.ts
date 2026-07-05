@@ -12,6 +12,7 @@
 //   vault-add    — user asked to add a new vault
 
 import type { VaultRecord } from "../vault/manifest.ts";
+import { formatAgo } from "./format-time.ts";
 
 const style = `
   :host {
@@ -116,18 +117,6 @@ const style = `
   }
 
 `;
-
-function formatAgo(ms: number): string {
-  if (ms < 30_000) return "just now";
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  return `${d}d ago`;
-}
 
 export interface VaultDetailSnapshot {
   record: VaultRecord;
