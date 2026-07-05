@@ -26,4 +26,5 @@ export {
   ZoneService,
   ZoneLockedError,
   ZoneMissingError,
+  HistoricalContentLockedError,
 } from "./zone-service.ts";

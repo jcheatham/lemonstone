@@ -7,7 +7,7 @@ const ENCRYPTION_MAGIC_PREFIXES: Uint8Array[] = [
   new Uint8Array([0x00, 0x73, 0x73, 0x68]), // OpenSSH encrypted key header
 ];
 
-function looksEncrypted(bytes: Uint8Array): boolean {
+export function looksEncrypted(bytes: Uint8Array): boolean {
   for (const prefix of ENCRYPTION_MAGIC_PREFIXES) {
     if (bytes.length >= prefix.length) {
       let match = true;

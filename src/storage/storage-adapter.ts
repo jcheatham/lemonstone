@@ -361,6 +361,18 @@ export class StorageAdapter {
     // path not found — caller should have checked listing; no-op.
   }
 
+  /** True if any note, canvas, or attachment currently lives under `prefix`.
+   *  Reads raw records only (no decode), so this works even for locked zones. */
+  async hasRecordsUnderPrefix(prefix: string): Promise<boolean> {
+    const db = await this.db();
+    for (const store of ["notes", "canvas", "attachments"] as const) {
+      for (const r of await db.getAll(store)) {
+        if (r.path.startsWith(prefix)) return true;
+      }
+    }
+    return false;
+  }
+
   /** Re-encode every record under `prefix` via `mutator(currentLayers) -> targetLayers`. */
   async reencodeUnderPrefix(
     prefix: string,

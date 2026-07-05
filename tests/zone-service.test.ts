@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { ZoneService, ZoneLockedError, ZoneMissingError } from "../src/codec/zone-service.ts";
+import { ZoneService, ZoneLockedError, ZoneMissingError, HistoricalContentLockedError } from "../src/codec/zone-service.ts";
 import { createZone } from "../src/codec/keys.ts";
 
 describe("ZoneService", { timeout: 30_000 }, () => {
@@ -106,5 +106,69 @@ describe("ZoneService", { timeout: 30_000 }, () => {
     svc.setZones([a, b]);
     await svc.unlockZone(a.id, "pa");
     expect(svc.lockedZoneIds()).toEqual([b.id]);
+  });
+
+  describe("decodeHistorical", () => {
+    it("returns plaintext unchanged", async () => {
+      const svc = new ZoneService();
+      const plaintext = new TextEncoder().encode("# hello\n");
+      const out = await svc.decodeHistorical(plaintext, "notes/a.md");
+      expect(new TextDecoder().decode(out)).toBe("# hello\n");
+    });
+
+    it("peels a single zone layer using the currently-unlocked identity", async () => {
+      const svc = new ZoneService();
+      const { zone, identity } = await createZone("secrets/", "pw");
+      svc.setZones([zone]);
+      svc.registerIdentity(zone.id, identity);
+      const codec = svc.getCodec(zone.id);
+      const plaintext = new TextEncoder().encode("top secret");
+      const ciphertext = await codec.encode(plaintext, "secrets/a.md");
+
+      const out = await svc.decodeHistorical(ciphertext, "secrets/a.md");
+      expect(new TextDecoder().decode(out)).toBe("top secret");
+    });
+
+    it("peels nested zone layers regardless of order, using whatever's unlocked", async () => {
+      const svc = new ZoneService();
+      const { zone: outer, identity: outerIdentity } = await createZone("journal/", "pw1");
+      const { zone: inner, identity: innerIdentity } = await createZone("journal/private/", "pw2");
+      svc.setZones([outer, inner]);
+      svc.registerIdentity(outer.id, outerIdentity);
+      svc.registerIdentity(inner.id, innerIdentity);
+
+      const plaintext = new TextEncoder().encode("deeply private");
+      // Encrypt inner-first, then outer wraps it (matches encodeForPath order).
+      const innerCt = await svc.getCodec(inner.id).encode(plaintext, "journal/private/a.md");
+      const outerCt = await svc.getCodec(outer.id).encode(innerCt, "journal/private/a.md");
+
+      const out = await svc.decodeHistorical(outerCt, "journal/private/a.md");
+      expect(new TextDecoder().decode(out)).toBe("deeply private");
+    });
+
+    it("throws HistoricalContentLockedError when the needed zone isn't unlocked", async () => {
+      const svc = new ZoneService();
+      const { zone, identity } = await createZone("secrets/", "pw");
+      svc.setZones([zone]);
+      const codec = new (await import("../src/codec/age-codec.ts")).AgeCodec(identity, zone.recipient);
+      const ciphertext = await codec.encode(new TextEncoder().encode("hidden"), "secrets/a.md");
+
+      // Zone is registered but never unlocked in this service instance.
+      await expect(svc.decodeHistorical(ciphertext, "secrets/a.md")).rejects.toThrow(
+        HistoricalContentLockedError,
+      );
+    });
+
+    it("throws HistoricalContentLockedError when the zone was later removed entirely", async () => {
+      const svc = new ZoneService();
+      const { zone, identity } = await createZone("secrets/", "pw");
+      const codec = new (await import("../src/codec/age-codec.ts")).AgeCodec(identity, zone.recipient);
+      const ciphertext = await codec.encode(new TextEncoder().encode("hidden"), "secrets/a.md");
+
+      svc.setZones([]); // zone no longer exists in the current registry at all
+      await expect(svc.decodeHistorical(ciphertext, "secrets/a.md")).rejects.toThrow(
+        HistoricalContentLockedError,
+      );
+    });
   });
 });

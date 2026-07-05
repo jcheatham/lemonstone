@@ -638,12 +638,23 @@ export class VaultService extends EventTarget {
     return zone;
   }
 
+  /** True if any record currently lives under this zone's prefix. A zone with
+   *  no records can be removed without unlocking — there's nothing to re-encode. */
+  async zoneHasRecords(zoneId: string): Promise<boolean> {
+    const zone = this.zoneService.getZone(zoneId);
+    if (!zone) return false;
+    return this.storage.hasRecordsUnderPrefix(zone.prefix);
+  }
+
   /** Remove a zone: peel its layer off every record under its prefix, then
-   *  drop it from keys.json. The zone must be unlocked. */
+   *  drop it from keys.json. Only requires the zone to be unlocked if it still
+   *  has records to re-encode; an empty zone (e.g. its folder was deleted) can
+   *  always be dropped, even without the passphrase. */
   async removeZone(zoneId: string): Promise<void> {
     const zone = this.zoneService.getZone(zoneId);
     if (!zone) throw new Error(`no such zone: ${zoneId}`);
-    if (!this.zoneService.isUnlocked(zoneId)) {
+    const hasRecords = await this.storage.hasRecordsUnderPrefix(zone.prefix);
+    if (hasRecords && !this.zoneService.isUnlocked(zoneId)) {
       throw new Error(`zone ${zone.prefix} must be unlocked before removal`);
     }
 
@@ -705,6 +716,7 @@ export class VaultService extends EventTarget {
     message: string;
     author: string;
     date: number;
+    parent: string | null;
     changes: Array<{ path: string; status: "A" | "M" | "D" }>;
   } | null> {
     const res = await this.syncClient.call("commitDetails", { oid });
@@ -715,6 +727,24 @@ export class VaultService extends EventTarget {
     await this.syncClient.call("restoreToCommit", { oid });
     // After the worker commits locally, kick off a sync so it pushes.
     await this.syncClient.call("sync").catch(console.error);
+  }
+
+  /** Raw bytes of a file as of a specific commit. Null if the path didn't
+   *  exist in that commit's tree. Ciphertext for files under an encryption
+   *  zone — use `readDecodedFileAtCommit` to get plaintext. */
+  async readFileAtCommit(oid: string, path: string): Promise<Uint8Array | null> {
+    const res = await this.syncClient.call("readFileAtCommit", { oid, path });
+    return (res.result as { bytes: Uint8Array | null }).bytes;
+  }
+
+  /** Decrypted content of a file as of a specific commit, for the History
+   *  viewer. Returns null if the path didn't exist in that commit. Throws
+   *  HistoricalContentLockedError if the content is still encrypted and the
+   *  relevant zone(s) aren't currently unlocked. */
+  async readDecodedFileAtCommit(oid: string, path: string): Promise<Uint8Array | null> {
+    const bytes = await this.readFileAtCommit(oid, path);
+    if (bytes === null) return null;
+    return this.zoneService.decodeHistorical(bytes, path);
   }
 
   // ── Attachment API ──────────────────────────────────────────────────────────

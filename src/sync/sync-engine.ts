@@ -1021,10 +1021,12 @@ export class SyncEngine {
     message: string;
     author: string;
     date: number;
+    parent: string | null;
     changes: Array<{ path: string; status: "A" | "M" | "D" }>;
   } | null> {
     try {
       const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid });
+      const parentOid = commit.parent?.[0] ?? null;
       const curPaths = await this.treePaths(oid);
       let parentPaths = new Set<string>();
       if (commit.parent && commit.parent[0]) {
@@ -1052,10 +1054,28 @@ export class SyncEngine {
         message: commit.message,
         author: `${commit.author.name} <${commit.author.email}>`,
         date: commit.author.timestamp * 1000,
+        parent: parentOid,
         changes,
       };
     } catch (err) {
       console.warn("[sync] commitDetails failed:", err);
+      return null;
+    }
+  }
+
+  /**
+   * Read a single file's raw bytes as they existed in a specific commit.
+   * Returns null if the path didn't exist in that commit's tree (added
+   * later, or already deleted as of this commit). Bytes are whatever was
+   * actually stored — ciphertext for files under an encryption zone — the
+   * caller is responsible for decoding.
+   */
+  async readFileAtCommit(oid: string, path: string): Promise<Uint8Array | null> {
+    try {
+      const { commit } = await git.readCommit({ fs: this.fs, dir: GIT_DIR, oid });
+      const { blob } = await git.readBlob({ fs: this.fs, dir: GIT_DIR, oid: commit.tree, filepath: path });
+      return blob;
+    } catch {
       return null;
     }
   }

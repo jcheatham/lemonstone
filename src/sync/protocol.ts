@@ -18,6 +18,7 @@ export type SyncOp =
   | "recentCommits"
   | "commitDetails"
   | "restoreToCommit"
+  | "readFileAtCommit"
   | "readRepoFile"
   | "writeRepoFile";
 

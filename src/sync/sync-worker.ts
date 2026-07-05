@@ -146,6 +146,14 @@ self.addEventListener("message", async (e: MessageEvent<WorkerRequest>) => {
         break;
       }
 
+      case "readFileAtCommit": {
+        const oid = args["oid"] as string;
+        const path = args["path"] as string;
+        const bytes = await requireEngine(requireVaultId(args)).readFileAtCommit(oid, path);
+        self.postMessage(ok(id, { bytes }));
+        break;
+      }
+
       case "readRepoFile": {
         const path = args["path"] as string;
         const bytes = await requireEngine(requireVaultId(args)).readRepoFile(path);

@@ -29,6 +29,8 @@ import "./ls-snippet.ts";
 import { snippetTemplate } from "../snippet/template.ts";
 import "./ls-history.ts";
 import type { LSHistory, CommitSummary } from "./ls-history.ts";
+import "./ls-history-file-modal.ts";
+import type { LSHistoryFileModal } from "./ls-history-file-modal.ts";
 import "./ls-vaults.ts";
 import type { LSVaults } from "./ls-vaults.ts";
 import "./ls-vault-detail.ts";
@@ -418,6 +420,7 @@ export class LSApp extends HTMLElement {
   #authModal!: LSModal;
   #unlockModal!: LSUnlockModal;
   #encryptFolderModal!: LSEncryptFolderModal;
+  #historyFileModal!: LSHistoryFileModal;
   readonly #dailyFolder = "daily";
   #previewedCategory = "files";
   #activeCategory: string | null = null;
@@ -795,6 +798,8 @@ export class LSApp extends HTMLElement {
       this.#handleCreateZone(prefix, passphrase).catch(console.error);
     });
 
+    this.#historyFileModal = document.createElement("ls-history-file-modal") as LSHistoryFileModal;
+
     // Share-link modals.
     this.#shareCreateModal = document.createElement("ls-share-create-modal") as LSShareCreateModal;
     this.#shareAcceptModal = document.createElement("ls-share-accept-modal") as LSShareAcceptModal;
@@ -832,6 +837,7 @@ export class LSApp extends HTMLElement {
       this.#authOverlay,
       this.#unlockModal,
       this.#encryptFolderModal,
+      this.#historyFileModal,
       this.#shareCreateModal,
       this.#shareAcceptModal,
       this.#palette,
@@ -1175,7 +1181,12 @@ export class LSApp extends HTMLElement {
         status.style.cssText = `color:${color};font-weight:600;width:14px;flex-shrink:0;`;
         const name = document.createElement("span");
         name.textContent = change.path;
-        name.style.cssText = "color:var(--ls-color-fg,#e0e0e0);word-break:break-all;";
+        name.style.cssText =
+          "color:var(--ls-color-fg,#e0e0e0);word-break:break-all;cursor:pointer;text-decoration:underline dotted;";
+        name.title = "View content as of this commit";
+        name.addEventListener("click", () => {
+          this.#viewFileAtCommit(change.path, change.status, details.oid, details.parent).catch(console.error);
+        });
         item.append(status, name);
         list.appendChild(item);
       }
@@ -1183,6 +1194,38 @@ export class LSApp extends HTMLElement {
 
     view.append(title, meta, actions, changesHeader, list);
     this.#editorWrap.appendChild(view);
+  }
+
+  /** Show a file's decrypted content as of a commit (History panel).
+   *  Deleted files are read from the commit's parent, since the file itself
+   *  has nothing to show at `oid`. */
+  async #viewFileAtCommit(
+    path: string,
+    status: "A" | "M" | "D",
+    oid: string,
+    parentOid: string | null,
+  ): Promise<void> {
+    const targetOid = status === "D" ? parentOid : oid;
+    const short = (targetOid ?? oid).slice(0, 7);
+    const label = status === "D" ? `before deletion in ${oid.slice(0, 7)} (commit ${short})` : `as of ${short}`;
+    this.#historyFileModal.showLoading(path, label);
+    if (!targetOid) {
+      this.#historyFileModal.setError("No prior version to show.");
+      return;
+    }
+    try {
+      const bytes = await vaultService.readDecodedFileAtCommit(targetOid, path);
+      this.#historyFileModal.setContent(bytes === null ? null : new TextDecoder().decode(bytes));
+    } catch (err) {
+      if ((err as Error)?.name === "HistoricalContentLockedError") {
+        this.#historyFileModal.setError(
+          "This content is still encrypted. Unlock the relevant folder, then try again.",
+        );
+      } else {
+        console.error(err);
+        this.#historyFileModal.setError("Couldn't decrypt this file. See console.");
+      }
+    }
   }
 
   async #restoreToCommit(oid: string): Promise<void> {
@@ -1294,7 +1337,19 @@ export class LSApp extends HTMLElement {
       return;
     }
     const label = folder.split("/").pop() ?? folder;
-    await vaultService.writeNote(path, `# ${label}\n\n`);
+    try {
+      await vaultService.writeNote(path, `# ${label}\n\n`);
+    } catch (err) {
+      if ((err as Error)?.name === "ZoneLockedError") {
+        getToast().show(
+          `"${folder}" overlaps a locked encrypted zone. Unlock it, or remove it via "Decrypt folder…".`,
+          "error",
+          6000,
+        );
+        return;
+      }
+      throw err;
+    }
     await this.#loadNoteList();
     navigateTo(path);
   }
@@ -1370,6 +1425,19 @@ export class LSApp extends HTMLElement {
     try {
       for (const entry of entries) {
         await vaultService.delete(entry.path);
+      }
+      // Deleting a folder should also drop any encryption zone anchored at or
+      // nested under it — otherwise the zone's lock outlives its last file and
+      // blocks anyone from reusing that path (see ZoneLockedError).
+      const zones = vaultService.listZones().filter(
+        (z) => z.prefix === prefix || z.prefix.startsWith(prefix),
+      );
+      for (const zone of zones) {
+        try {
+          await vaultService.removeZone(zone.id);
+        } catch (err) {
+          console.error(`[delete-folder] couldn't drop zone ${zone.prefix}:`, err);
+        }
       }
       await this.#loadNoteList();
       if (this.#activePath.startsWith(prefix)) navigateHome();
@@ -2612,12 +2680,18 @@ export class LSApp extends HTMLElement {
     if (!zoneId) return;
     const zone = zones.find((z) => z.id === zoneId);
     if (!zone) return;
-    if (!vaultService.isZoneUnlocked(zone.id)) {
+    // An empty zone (its folder was deleted, or it never had files) has
+    // nothing to re-encode, so it can be dropped without the passphrase.
+    const hasRecords = await vaultService.zoneHasRecords(zone.id);
+    if (hasRecords && !vaultService.isZoneUnlocked(zone.id)) {
       this.#unlockModal.setZone(zone.id, zone.prefix);
       this.#unlockModal.show();
       return;
     }
-    if (!confirm(`Decrypt ${zone.prefix}? Files will become plaintext in git.`)) return;
+    const confirmMsg = hasRecords
+      ? `Decrypt ${zone.prefix}? Files will become plaintext in git.`
+      : `Remove the empty encryption zone at ${zone.prefix}? It has no files left.`;
+    if (!confirm(confirmMsg)) return;
     try {
       await vaultService.removeZone(zone.id);
       getToast().show(`"${zone.prefix}" decrypted.`, "success", 4000);

@@ -9,6 +9,7 @@ import { AgeCodec } from "./age-codec.ts";
 import type { Zone } from "./zones.ts";
 import { applicableZones, zoneById } from "./zones.ts";
 import { unwrapZoneIdentity } from "./keys.ts";
+import { looksEncrypted } from "./identity-codec.ts";
 
 export class ZoneLockedError extends Error {
   constructor(public readonly zoneId: string, public readonly prefix: string) {
@@ -21,6 +22,15 @@ export class ZoneMissingError extends Error {
   constructor(public readonly zoneId: string) {
     super(`zone not found in keys.json: ${zoneId}`);
     this.name = "ZoneMissingError";
+  }
+}
+
+/** Thrown by decodeHistorical when bytes still look encrypted after trying
+ *  every currently-unlocked zone's identity. */
+export class HistoricalContentLockedError extends Error {
+  constructor(public readonly path: string) {
+    super(`content at ${path} is still encrypted; unlock the relevant zone(s) to view it`);
+    this.name = "HistoricalContentLockedError";
   }
 }
 
@@ -103,5 +113,36 @@ export class ZoneService {
     const codec = new AgeCodec(identity, zone.recipient);
     this.codecs.set(zoneId, codec);
     return codec;
+  }
+
+  /**
+   * Decode bytes read from a historical git blob (e.g. a file's content as of
+   * some past commit). Historical commits don't carry the app's own codec /
+   * layer bookkeeping — that descriptor only exists in IndexedDB for the
+   * *current* record — so instead of trusting a known layer list, this tries
+   * every currently-unlocked zone's identity and peels a layer whenever one
+   * succeeds, repeating until the bytes no longer look like age ciphertext.
+   * Throws HistoricalContentLockedError if bytes still look encrypted and no
+   * unlocked identity can peel them further.
+   */
+  async decodeHistorical(bytes: Uint8Array, path: string): Promise<Uint8Array> {
+    let out = bytes;
+    const maxRounds = this.zones.length + 1;
+    for (let round = 0; round < maxRounds && looksEncrypted(out); round++) {
+      let peeled = false;
+      for (const zone of this.zones) {
+        if (!this.identities.has(zone.id)) continue;
+        try {
+          out = await this.getCodec(zone.id).decode(out, path);
+          peeled = true;
+          break;
+        } catch {
+          continue;
+        }
+      }
+      if (!peeled) throw new HistoricalContentLockedError(path);
+    }
+    if (looksEncrypted(out)) throw new HistoricalContentLockedError(path);
+    return out;
   }
 }
