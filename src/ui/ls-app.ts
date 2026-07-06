@@ -724,7 +724,7 @@ export class LSApp extends HTMLElement {
     this.#statusDot = document.createElement("div");
     this.#statusDot.className = "status-dot";
     this.#statusText = document.createElement("span");
-    this.#statusText.textContent = "Ready";
+    this.#statusText.textContent = "Not synced yet";
     const mutedLinkCss =
       "color:var(--ls-color-fg-muted,#64748b);font-size:11px;text-decoration:none;" +
       "font-family:var(--ls-font-mono,monospace);white-space:nowrap;";
@@ -1667,7 +1667,19 @@ export class LSApp extends HTMLElement {
       vaultService.getHead()
         .then((head) => { if (head) this.#setRepoSha(head); })
         .catch(() => { /* best-effort */ });
-      vaultService.sync().catch(console.error);
+      // Boot sync — give this the same "syncing" indicator and failure
+      // surfacing as every other sync trigger (wake-sync, manual "Sync now",
+      // force-pull/push). Previously this one was silent: on a device with
+      // no persisted lastSyncedAt yet (a pre-existing vault opened for the
+      // first time after this field was added, or a genuinely fresh vault),
+      // the status bar just sat on its initial "Not synced yet" placeholder
+      // with no indication anything was happening — and a failure here was
+      // only ever logged to the console, never shown.
+      this.#setStatus("syncing", "Checking for updates…");
+      vaultService.sync().catch((err) => {
+        this.#setStatus("error", "Sync failed — tap Sync to retry");
+        console.error(err);
+      });
       await this.#loadNoteList();
     }
     await this.#handleRoute(currentRoute());
@@ -1758,8 +1770,11 @@ export class LSApp extends HTMLElement {
       navigateToVault(record.id);
       await multiplexer.open(record.id);
       this.#setRepoLabel(record.repoFullName);
-      vaultService.sync().catch(console.error);
-      this.#setStatus("ok", "Ready");
+      this.#setStatus("syncing", "Checking for updates…");
+      vaultService.sync().catch((err) => {
+        this.#setStatus("error", "Sync failed — tap Sync to retry");
+        console.error(err);
+      });
       await this.#loadNoteList();
       getToast().show(`Added shared vault "${record.label}".`, "success", 5000);
     } catch (err) {
@@ -1783,8 +1798,11 @@ export class LSApp extends HTMLElement {
       // the vault is usable — callers (like sync kicks) depend on it.
       await multiplexer.open(record.id);
       this.#setRepoLabel(record.repoFullName);
-      vaultService.sync().catch(console.error);
-      this.#setStatus("ok", "Ready");
+      this.#setStatus("syncing", "Checking for updates…");
+      vaultService.sync().catch((err) => {
+        this.#setStatus("error", "Sync failed — tap Sync to retry");
+        console.error(err);
+      });
       await this.#loadNoteList();
     } catch (err) {
       console.error("[vault] Adding vault failed:", err);
@@ -1836,7 +1854,10 @@ export class LSApp extends HTMLElement {
   #wireVaultEvents(): void {
     vaultService.addEventListener("vault:ready", () => {
       this.#loadNoteList().catch(console.error);
-      this.#setStatus("ok", "Ready");
+      // Local data is loaded, but this says nothing about GitHub sync state —
+      // show whatever the clock actually knows right now (which may still be
+      // "Not synced yet") rather than a hardcoded claim.
+      this.#setStatus("ok", this.#formatStatusClock());
     });
 
     // Keep the Vaults panel and the status-bar repo label in sync with the
@@ -1954,8 +1975,9 @@ export class LSApp extends HTMLElement {
   #setStatus(state: "ok" | "syncing" | "error" | "conflict", text: string): void {
     // Non-ok states are informative by themselves ("Saving…", "Sync failed");
     // the ok state, on the other hand, is the natural resting point — we want
-    // "Synced 3m ago" there, not a static "Ready". Treat incoming ok text as
-    // a short-lived override that fades back to the idle clock.
+    // the "Synced … · Written …" clock there, not a static placeholder. Treat
+    // incoming ok text as a short-lived override that fades back to the idle
+    // clock (see #formatStatusClock).
     if (state === "ok") {
       this.#statusTransientText = text;
       this.#statusTransientUntil = Date.now() + 3500;
@@ -1975,7 +1997,8 @@ export class LSApp extends HTMLElement {
    *   - "Written" — the current commit's own authored timestamp, i.e. content
    *     freshness. The repo/sha header (see #renderRepoInfo) identifies WHAT
    *     commit that is; this is WHEN it was written.
-   *  Falls back to "Ready" until at least one of the two is known. */
+   *  Falls back to "Not synced yet" until at least one of the two is known —
+   *  never a bare "Ready", which says nothing about sync state at all. */
   #formatStatusClock(): string {
     // `vaultService` is a Proxy over the current VaultService; reading any
     // property on it before a vault is open throws. Guard every access.
@@ -1984,7 +2007,7 @@ export class LSApp extends HTMLElement {
     const parts: string[] = [];
     if (lastChecked) parts.push(`Synced ${formatClockTime(lastChecked)}`);
     if (commitDate) parts.push(`Written ${formatClockTime(commitDate)}`);
-    return parts.length ? parts.join(" · ") : "Ready";
+    return parts.length ? parts.join(" · ") : "Not synced yet";
   }
 
   #renderStatusText(): void {
