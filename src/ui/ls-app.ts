@@ -6,6 +6,7 @@
 
 import { vaultService, multiplexer } from "../vault/index.ts";
 import { MANIFEST_DB_NAME, type VaultRecord } from "../vault/manifest.ts";
+import { bootGate } from "../vault/boot-gate.ts";
 import type { AuthPayload } from "../storage/schema.ts";
 import { currentRoute, navigateTo, navigateHome, navigateToVault, navigateToVaults } from "./router.ts";
 import type { Route } from "./router.ts";
@@ -1632,8 +1633,11 @@ export class LSApp extends HTMLElement {
   // ── Init ─────────────────────────────────────────────────────────────────
 
   async #init(): Promise<void> {
-    // main.ts has already awaited multiplexer.boot() and attempted to open
-    // the last-used vault. Here we catch up on the UI side.
+    // connectedCallback() (and therefore this) can fire before main.ts's own
+    // top-level code has run at all — see src/vault/boot-gate.ts. Wait for
+    // main.ts's boot()+openLastUsed() to actually settle before looking at
+    // multiplexer.currentVault, or this races it and can lose.
+    await bootGate;
     await this.#refreshVaultsList();
 
     // If the user arrived via a share link, honor it regardless of whether
@@ -1857,7 +1861,7 @@ export class LSApp extends HTMLElement {
       // Local data is loaded, but this says nothing about GitHub sync state —
       // show whatever the clock actually knows right now (which may still be
       // "Not synced yet") rather than a hardcoded claim.
-      this.#setStatus("ok", this.#formatStatusClock());
+      this.#showSyncedNow();
     });
 
     // Keep the Vaults panel and the status-bar repo label in sync with the
@@ -1922,7 +1926,7 @@ export class LSApp extends HTMLElement {
     });
 
     vaultService.addEventListener("vault:synced", (e) => {
-      this.#setStatus("ok", this.#formatStatusClock());
+      this.#showSyncedNow();
       const headOid = (e as CustomEvent).detail?.headOid as string | undefined;
       if (headOid) this.#setRepoSha(headOid);
       // Refresh the file list — catches remote adds/removes that don't emit
@@ -1962,7 +1966,7 @@ export class LSApp extends HTMLElement {
     vaultService.addEventListener("vault:synced", () => {
       setTimeout(() => {
         if (this.#statusDot.classList.contains("syncing")) {
-          this.#setStatus("ok", this.#formatStatusClock());
+          this.#showSyncedNow();
         }
       }, 200);
     });
@@ -2008,6 +2012,24 @@ export class LSApp extends HTMLElement {
     if (lastChecked) parts.push(`Synced ${formatClockTime(lastChecked)}`);
     if (commitDate) parts.push(`Written ${formatClockTime(commitDate)}`);
     return parts.length ? parts.join(" · ") : "Not synced yet";
+  }
+
+  /** Call when a sync completes. The idle clock IS the confirmation here, so
+   *  there's no separate message worth freezing — and freezing one is
+   *  actively harmful: `vault:synced` handlers call this BEFORE #setRepoSha
+   *  and the async #loadHistory() have had a chance to update the commit
+   *  info, so a frozen snapshot captured here would show "Synced …" without
+   *  "Written …" for its whole 3.5s window — and #setCommitInfo's re-render
+   *  a moment later would be silently discarded by #renderStatusText's
+   *  transient-wins check, with nothing forcing a correct re-render until
+   *  the next unrelated status change or the 15s ticker. Clearing the
+   *  transient outright instead means every #renderStatusText() call from
+   *  here on reflects current state immediately, live. */
+  #showSyncedNow(): void {
+    this.#statusDot.className = "status-dot ok";
+    this.#statusTransientText = "";
+    this.#statusTransientUntil = 0;
+    this.#renderStatusText();
   }
 
   #renderStatusText(): void {
@@ -2489,7 +2511,7 @@ export class LSApp extends HTMLElement {
       await vaultService.forcePull();
       await this.#loadNoteList();
       navigateHome();
-      this.#setStatus("ok", this.#formatStatusClock());
+      this.#showSyncedNow();
       getToast().show("Local vault reset to match remote.", "success", 4000);
     } catch (err) {
       this.#setStatus("error", "Force pull failed");
@@ -2507,7 +2529,7 @@ export class LSApp extends HTMLElement {
     this.#setStatus("syncing", "Force-pushing…");
     try {
       await vaultService.forcePush();
-      this.#setStatus("ok", this.#formatStatusClock());
+      this.#showSyncedNow();
       getToast().show("Remote overwritten with local state.", "success", 4000);
     } catch (err) {
       this.#setStatus("error", "Force push failed");
