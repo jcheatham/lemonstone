@@ -1,4 +1,4 @@
-export { VaultService } from "./vault-service.ts";
+export { VaultService, SYNC_POLL_INTERVAL_MS } from "./vault-service.ts";
 export type { VaultEventType, TagInfo, VaultServiceConfig } from "./vault-service.ts";
 export { vaultService, multiplexer, VaultMultiplexer } from "./multiplexer.ts";
 export type { VaultRecord } from "./manifest.ts";

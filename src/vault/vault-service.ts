@@ -20,6 +20,14 @@ import { WikilinkResolver } from "./wikilink-resolver.ts";
 import { VaultSearch, type SearchResult } from "./search.ts";
 import { SyncClient } from "../sync/sync-client.ts";
 
+/** How often the vault re-checks GitHub while it stays open and visible.
+ *  visibilitychange/focus/online/pageshow (see #wireNetworkEvents) cover
+ *  the common wake-ups, but a tab that's foregrounded and left idle (no
+ *  blur, no refocus) never fires any of them — remote edits from another
+ *  device would go unnoticed indefinitely. This heartbeat closes that gap.
+ *  Exported so the UI can display it (see ls-app.ts build-info footer). */
+export const SYNC_POLL_INTERVAL_MS = 5 * 60_000;
+
 export type VaultEventType =
   | "note:changed"
   | "note:deleted"
@@ -239,7 +247,16 @@ export class VaultService extends EventTarget {
     window.addEventListener("pageshow", (e) => {
       if ((e as PageTransitionEvent).persisted) this.#wakeSync("pageshow");
     });
+
+    // Heartbeat re-sync — see SYNC_POLL_INTERVAL_MS. Skips the tick while
+    // hidden; visibilitychange already syncs on the way in and back out, so
+    // a background tick would just be wasted network/battery.
+    this.#syncPollTimer = setInterval(() => {
+      if (document.visibilityState === "visible") this.#wakeSync("interval");
+    }, SYNC_POLL_INTERVAL_MS);
   }
+
+  #syncPollTimer: ReturnType<typeof setInterval> | null = null;
 
   /** Wake-up sync. Emits `vault:wakeSync` so the UI can surface a brief
    *  "checking for updates" indicator, then kicks a sync. If it's been only
@@ -924,6 +941,7 @@ export class VaultService extends EventTarget {
   dispose(): void {
     if (this.snapshotTimer) { clearTimeout(this.snapshotTimer); this.snapshotTimer = null; }
     if (this.syncDebounceTimer) { clearTimeout(this.syncDebounceTimer); this.syncDebounceTimer = null; }
+    if (this.#syncPollTimer) { clearInterval(this.#syncPollTimer); this.#syncPollTimer = null; }
     this.outgoing.clear();
     this.incoming.clear();
     this.tagIndex.clear();

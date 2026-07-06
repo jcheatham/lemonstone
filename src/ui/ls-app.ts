@@ -4,7 +4,7 @@
 //   <ls-file-tree>, <ls-editor>, <ls-backlinks>, <ls-outline>,
 //   <ls-command-palette>, <ls-switcher>, hash router, vaultService.
 
-import { vaultService, multiplexer } from "../vault/index.ts";
+import { vaultService, multiplexer, SYNC_POLL_INTERVAL_MS } from "../vault/index.ts";
 import { MANIFEST_DB_NAME, type VaultRecord } from "../vault/manifest.ts";
 import { bootGate } from "../vault/boot-gate.ts";
 import type { AuthPayload } from "../storage/schema.ts";
@@ -759,6 +759,15 @@ export class LSApp extends HTMLElement {
       buildLabel.title = "Source commit for this build";
     }
     this.#categoryNav.appendChild(buildLabel);
+
+    // Second footer line — the background heartbeat interval, so it's clear
+    // the app checks GitHub on its own while open, not just on save/focus.
+    const syncIntervalLabel = document.createElement("div");
+    syncIntervalLabel.slot = "footer";
+    syncIntervalLabel.textContent = `syncs every ${Math.round(SYNC_POLL_INTERVAL_MS / 60_000)}m`;
+    syncIntervalLabel.title = "Automatic background sync interval while this vault is open and visible";
+    syncIntervalLabel.style.cssText = mutedLinkCss + "margin-top:2px;";
+    this.#categoryNav.appendChild(syncIntervalLabel);
     // Status bar is intentionally NOT appended to #main. It sits at the root
     // so it stays visible regardless of which pane is showing on mobile.
     this.#statusBar = statusBar;
