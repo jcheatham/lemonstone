@@ -127,6 +127,8 @@ export interface VaultDetailSnapshot {
   zoneCount: number;
   /** Number of currently-locked zones. */
   lockedZoneCount: number;
+  /** Number of S3 vaults activated on this device (local, not vault-scoped), or 0. */
+  s3CardCount: number;
 }
 
 export class LSVaultDetail extends HTMLElement {
@@ -216,6 +218,9 @@ export class LSVaultDetail extends HTMLElement {
         "Encryption zones",
         `${snap.zoneCount} (${snap.lockedZoneCount} locked)`,
       ]);
+    }
+    if (snap.s3CardCount > 0) {
+      rows.push(["S3 vaults", `${snap.s3CardCount}`]);
     }
     for (const [k, v] of rows) {
       const dt = document.createElement("dt");

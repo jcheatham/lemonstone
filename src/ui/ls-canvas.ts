@@ -1580,6 +1580,18 @@ export class LSCanvas extends HTMLElement {
         body.querySelectorAll<HTMLElement>("a:not(.wikilink)").forEach((a) => {
           a.addEventListener("pointerdown", (ev) => ev.stopPropagation());
         });
+        body.querySelectorAll<HTMLElement>(".s3vault-card").forEach((card) => {
+          card.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const blob = card.dataset["blob"];
+            if (!blob) return;
+            this.dispatchEvent(new CustomEvent("s3card-click", {
+              bubbles: true, composed: true, detail: { blob },
+            }));
+          });
+          card.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+        });
       } else {
         body.textContent = "Double-click to edit";
         body.style.opacity = "0.5";

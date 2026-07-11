@@ -8,7 +8,7 @@ import { vaultService, multiplexer, SYNC_POLL_INTERVAL_MS } from "../vault/index
 import { MANIFEST_DB_NAME, type VaultRecord } from "../vault/manifest.ts";
 import { bootGate } from "../vault/boot-gate.ts";
 import type { AuthPayload } from "../storage/schema.ts";
-import { currentRoute, navigateTo, navigateHome, navigateToVault, navigateToVaults } from "./router.ts";
+import { currentRoute, navigateTo, navigateHome, navigateToVault, navigateToVaults, navigateToS3 } from "./router.ts";
 import type { Route } from "./router.ts";
 import { parseHeadings } from "./ls-outline.ts";
 import "./ls-modal.ts";
@@ -33,7 +33,10 @@ import type { LSHistory, CommitSummary } from "./ls-history.ts";
 import "./ls-history-file-modal.ts";
 import type { LSHistoryFileModal } from "./ls-history-file-modal.ts";
 import "./ls-vaults.ts";
-import type { LSVaults } from "./ls-vaults.ts";
+import type { LSVaults, S3CardRow } from "./ls-vaults.ts";
+import "./ls-s3-detail.ts";
+import type { LSS3Detail } from "./ls-s3-detail.ts";
+import type { S3TreeEntry } from "./ls-s3-tree.ts";
 import "./ls-vault-detail.ts";
 import type { LSVaultDetail, VaultDetailSnapshot } from "./ls-vault-detail.ts";
 import "./ls-share-create-modal.ts";
@@ -44,6 +47,18 @@ import "./ls-unlock-modal.ts";
 import type { LSUnlockModal } from "./ls-unlock-modal.ts";
 import "./ls-enable-encryption-modal.ts";
 import type { LSEncryptFolderModal } from "./ls-enable-encryption-modal.ts";
+import "./ls-s3-card-create-modal.ts";
+import type { LSS3CardCreateModal, S3CardDetails } from "./ls-s3-card-create-modal.ts";
+import "./ls-s3-card-accept-modal.ts";
+import type { LSS3CardAcceptModal } from "./ls-s3-card-accept-modal.ts";
+import { encodeS3Card, generateCardId, type S3CardPayload } from "../s3/card.ts";
+import { ACTIVATED_S3_CARDS_CONFIG_KEY, isActivatedS3Card, type ActivatedS3Card, type ActivatedS3Cards } from "../s3/activation.ts";
+import type { S3Credential } from "../s3/credential.ts";
+import { runConnectionTest } from "../s3/connection-test.ts";
+import { S3CardClient } from "../s3/s3-client.ts";
+import { uploadObject } from "../s3/upload.ts";
+import { copyObjectSizeAware, moveObject } from "../s3/move.ts";
+import { shouldWarnBeforeUpload, batchKeysForDelete, buildCopyPlan } from "../s3/operations.ts";
 import { parseCanvas, serializeCanvas, emptyCanvas, mergeCanvases } from "../canvas/index.ts";
 import { canInstall, triggerInstall } from "../pwa.ts";
 import { getToast } from "./ls-toast.ts";
@@ -64,6 +79,12 @@ const SNIPPET_GRANTS_KEY = "snippet:connect-grants";
 // Config key for the snippet source editor's line-wrap preference (local,
 // per-vault, unsynced — applies to all snippets on this device).
 const SNIPPET_WRAP_KEY = "snippet:line-wrap";
+// How long a bucket's root listing is served from #s3RootCache before
+// re-clicking the same bucket triggers a fresh ListObjectsV2 call — every
+// list is a real, potentially billable S3 request, so re-listing on every
+// single click (including re-clicking the bucket you're already viewing) is
+// wasteful.
+const S3_ROOT_CACHE_MS = 60_000;
 
 const style = `
   :host {
@@ -421,6 +442,24 @@ export class LSApp extends HTMLElement {
   #authModal!: LSModal;
   #unlockModal!: LSUnlockModal;
   #encryptFolderModal!: LSEncryptFolderModal;
+  #s3CardCreateModal!: LSS3CardCreateModal;
+  #s3CardAcceptModal!: LSS3CardAcceptModal;
+  #s3Detail!: LSS3Detail;
+  #s3UploadInput!: HTMLInputElement;
+  #s3UploadTargetPrefix = "";
+  /** One S3CardClient facade per activated card that's been opened this
+   *  session — the underlying worker session persists regardless, this just
+   *  avoids re-constructing the facade on every navigation. */
+  #s3Clients = new Map<string, S3CardClient>();
+  /** Which card ids currently have an open worker session, so re-visiting a
+   *  card doesn't re-read+re-send its credential unnecessarily. */
+  #s3SessionsOpen = new Set<string>();
+  /** Root-listing cache per card id, see S3_ROOT_CACHE_MS. In-memory only —
+   *  intentionally doesn't survive a page reload. */
+  #s3RootCache = new Map<string, { entries: S3TreeEntry[]; continuationToken?: string; loadedAt: number }>();
+  /** The activated card currently shown in #s3Detail, if any. Set only via
+   *  #setActiveS3Card so the switcher's row highlight stays in sync. */
+  #activeS3CardId: string | null = null;
   #historyFileModal!: LSHistoryFileModal;
   readonly #dailyFolder = "daily";
   #previewedCategory = "files";
@@ -640,6 +679,14 @@ export class LSApp extends HTMLElement {
       const { vaultId } = (e as CustomEvent<{ vaultId: string }>).detail;
       this.#selectedVaultId = vaultId;
       this.#vaultDrillActive = true;
+      // Selecting a vault row always shows its detail card in the main pane,
+      // even if it was previously showing an S3 bucket browser (#drillIntoS3
+      // hides #vaultDetail — nothing else was putting it back until now,
+      // so a vault click after visiting any bucket looked like a no-op).
+      this.#s3Detail.style.display = "none";
+      this.#setActiveS3Card(null);
+      this.#editorWrap.style.display = "none";
+      this.#vaultDetail.style.display = "flex";
       // Update the cached label SYNCHRONOUSLY from the in-memory vault list
       // so the mobile breadcrumb and detail snapshot below reflect the
       // clicked vault, not the previously-rendered one. Previously the
@@ -655,6 +702,12 @@ export class LSApp extends HTMLElement {
     });
     this.#vaults.addEventListener("vault-add", () => {
       this.#showAuthOverlay();
+    });
+    this.#vaults.addEventListener("s3-card-select", (e) => {
+      const { cardId } = (e as CustomEvent<{ cardId: string }>).detail;
+      const vaultId = multiplexer.currentVaultId;
+      if (!vaultId) return;
+      navigateToS3(vaultId, cardId);
     });
     vaultsPanel.appendChild(this.#vaults);
 
@@ -714,6 +767,64 @@ export class LSApp extends HTMLElement {
       this.#showAuthOverlay();
     });
     main.appendChild(this.#vaultDetail);
+
+    // S3 bucket browser pane — occupies the main area while an activated
+    // S3 card is being browsed (a route-driven state, see #drillIntoS3).
+    this.#s3Detail = document.createElement("ls-s3-detail") as LSS3Detail;
+    this.#s3Detail.style.cssText = "flex:1;min-height:0;display:none;";
+    this.#s3Detail.addEventListener("s3-refresh", () => {
+      if (!this.#activeS3CardId) return;
+      // The tree keeps showing its current content until the fresh listing
+      // arrives (see #loadS3Prefix) — this is the only refresh feedback.
+      this.#setStatus("syncing", "Refreshing…");
+      this.#loadS3Prefix(this.#activeS3CardId, "")
+        .then(() => this.#setStatus("ok", "Refreshed"))
+        .catch(console.error);
+    });
+    this.#s3Detail.addEventListener("s3-expand", (e) => {
+      const { prefix } = (e as CustomEvent<{ prefix: string }>).detail;
+      if (this.#activeS3CardId) this.#loadS3Prefix(this.#activeS3CardId, prefix).catch(console.error);
+    });
+    this.#s3Detail.addEventListener("s3-load-more", (e) => {
+      const { prefix, continuationToken } = (e as CustomEvent<{ prefix: string; continuationToken?: string }>).detail;
+      if (this.#activeS3CardId) this.#loadS3Prefix(this.#activeS3CardId, prefix, continuationToken).catch(console.error);
+    });
+    this.#s3Detail.addEventListener("s3-open", (e) => {
+      const { key } = (e as CustomEvent<{ key: string }>).detail;
+      this.#openS3Object(key).catch(console.error);
+    });
+    this.#s3Detail.addEventListener("s3-upload-request", (e) => {
+      const { prefix } = (e as CustomEvent<{ prefix: string }>).detail;
+      this.#s3UploadTargetPrefix = prefix;
+      this.#s3UploadInput.click();
+    });
+    this.#s3Detail.addEventListener("s3-new-folder-request", (e) => {
+      const { prefix } = (e as CustomEvent<{ prefix: string }>).detail;
+      this.#handleS3NewFolder(prefix).catch(console.error);
+    });
+    this.#s3Detail.addEventListener("s3-rename-request", (e) => {
+      const { key, kind, size } = (e as CustomEvent<{ key: string; kind: "object" | "prefix"; size?: number }>).detail;
+      this.#handleS3Rename(key, kind, size).catch(console.error);
+    });
+    this.#s3Detail.addEventListener("s3-delete-request", (e) => {
+      const { key, kind } = (e as CustomEvent<{ key: string; kind: "object" | "prefix" }>).detail;
+      this.#handleS3Delete(key, kind).catch(console.error);
+    });
+    main.appendChild(this.#s3Detail);
+
+    // Hidden file input driving all S3 uploads (header button + per-folder
+    // "upload here"); #s3UploadTargetPrefix records where the click came from.
+    this.#s3UploadInput = document.createElement("input");
+    this.#s3UploadInput.type = "file";
+    this.#s3UploadInput.multiple = true;
+    this.#s3UploadInput.style.display = "none";
+    this.#s3UploadInput.addEventListener("change", () => {
+      const files = this.#s3UploadInput.files;
+      const prefix = this.#s3UploadTargetPrefix;
+      this.#s3UploadInput.value = ""; // allow re-selecting the same file later
+      if (files && files.length > 0) this.#handleS3Upload(prefix, files).catch(console.error);
+    });
+    main.appendChild(this.#s3UploadInput);
 
     // Show welcome screen initially
     this.#showWelcome();
@@ -816,6 +927,22 @@ export class LSApp extends HTMLElement {
       this.#handleCreateZone(prefix, passphrase).catch(console.error);
     });
 
+    this.#s3CardCreateModal = document.createElement("ls-s3-card-create-modal") as LSS3CardCreateModal;
+    this.#s3CardCreateModal.addEventListener("s3-card-details-submit", (e) => {
+      const detail = (e as CustomEvent<S3CardDetails>).detail;
+      this.#handleS3CardDetailsSubmit(detail).catch(console.error);
+    });
+    this.#s3CardCreateModal.addEventListener("s3-card-passphrase-submit", (e) => {
+      const detail = (e as CustomEvent<S3CardDetails & { passphrase: string }>).detail;
+      this.#handleS3CardPassphraseSubmit(detail).catch(console.error);
+    });
+
+    this.#s3CardAcceptModal = document.createElement("ls-s3-card-accept-modal") as LSS3CardAcceptModal;
+    this.#s3CardAcceptModal.addEventListener("s3-card-accept", (e) => {
+      const { payload } = (e as CustomEvent<{ payload: S3CardPayload }>).detail;
+      this.#handleS3CardAccept(payload).catch(console.error);
+    });
+
     this.#historyFileModal = document.createElement("ls-history-file-modal") as LSHistoryFileModal;
 
     // Share-link modals.
@@ -855,6 +982,8 @@ export class LSApp extends HTMLElement {
       this.#authOverlay,
       this.#unlockModal,
       this.#encryptFolderModal,
+      this.#s3CardCreateModal,
+      this.#s3CardAcceptModal,
       this.#historyFileModal,
       this.#shareCreateModal,
       this.#shareAcceptModal,
@@ -902,6 +1031,8 @@ export class LSApp extends HTMLElement {
     // other category leaves the editor in place. Entering the Vaults
     // category always starts at the list (no drilled-in vault) so the
     // mobile pattern matches Files (subnav first, detail on click).
+    this.#s3Detail.style.display = "none";
+    this.#setActiveS3Card(null);
     if (id === "vaults") {
       this.#editorWrap.style.display = "none";
       this.#vaultDetail.style.display = "flex";
@@ -915,6 +1046,26 @@ export class LSApp extends HTMLElement {
     // Category-specific activation that used to live in the preview handler:
     if (id === "search") requestAnimationFrame(() => this.#search.focus());
     if (id === "history") this.#loadHistory().catch(console.error);
+    this.#updateMobileState();
+  }
+
+  /** Enter the S3 bucket browser for `cardId` — lives under the Vaults
+   *  category rail (same navigational level as a vault's own detail card),
+   *  but shows #s3Detail instead of #vaultDetail. Route-driven, not reached
+   *  via #drillInto directly (mirrors how "note" bypasses #drillInto too). */
+  #drillIntoS3(cardId: string): void {
+    this.#activeCategory = "vaults";
+    this.#previewedCategory = "vaults";
+    this.#categoryNav.active = "vaults";
+    this.#categoryNav.previewed = "vaults";
+    this.#categoryNav.mode = "rail";
+    this.#showPanel("vaults");
+    this.#categoryPanel.classList.remove("dimmed");
+    this.#editorWrap.style.display = "none";
+    this.#vaultDetail.style.display = "none";
+    this.#s3Detail.style.display = "flex";
+    this.#vaultDrillActive = true;
+    this.#openS3Card(cardId).catch(console.error);
     this.#updateMobileState();
   }
 
@@ -1058,6 +1209,10 @@ export class LSApp extends HTMLElement {
           if (picked) canvas.insertFileNodeAtCenter(picked);
         })
         .catch(console.error);
+    });
+    canvas.addEventListener("s3card-click", (e) => {
+      const { blob } = (e as CustomEvent<{ blob: string }>).detail;
+      this.#handleS3CardClick(blob);
     });
     this.#editorWrap.appendChild(canvas);
     this.#editor = null;
@@ -1862,6 +2017,503 @@ export class LSApp extends HTMLElement {
     }
   }
 
+  // ── S3 vaults ────────────────────────────────────────────────────────────
+
+  /** "Insert S3 vault…" macro entry point. Vaults are embedded in note
+   *  content, so this requires a note (not a canvas/snippet) to be open. */
+  #promptInsertS3Card(): void {
+    if (!this.#editor || !this.#activePath || this.#activePath.endsWith(".canvas") || this.#activePath.toLowerCase().endsWith(".html")) {
+      getToast().show("Open a note first to insert an S3 vault.", "info", 4000);
+      return;
+    }
+    this.#s3CardCreateModal.show();
+  }
+
+  async #handleS3CardDetailsSubmit(detail: S3CardDetails): Promise<void> {
+    const credential: S3Credential = {
+      version: 1,
+      accessKeyId: detail.accessKeyId,
+      secretAccessKey: detail.secretAccessKey,
+      sessionToken: detail.sessionToken,
+    };
+    this.#s3CardCreateModal.setBusy("Testing connection…");
+    try {
+      const outcome = await runConnectionTest(detail.bucket, detail.region, credential);
+      if (!outcome.ok) {
+        this.#s3CardCreateModal.setError(outcome.guidance ?? "Connection test failed.");
+        return;
+      }
+      this.#s3CardCreateModal.showPassphraseStep();
+    } catch (err) {
+      console.error(err);
+      this.#s3CardCreateModal.setError((err as Error).message || "Connection test failed.");
+    }
+  }
+
+  async #handleS3CardPassphraseSubmit(detail: S3CardDetails & { passphrase: string }): Promise<void> {
+    this.#s3CardCreateModal.setBusy("Encrypting vault…");
+    try {
+      if (!this.#editor) throw new Error("No note is open to insert the vault into.");
+      const payload: S3CardPayload = {
+        version: 1,
+        id: generateCardId(),
+        displayName: detail.displayName,
+        bucket: detail.bucket,
+        region: detail.region,
+        accessKeyId: detail.accessKeyId,
+        secretAccessKey: detail.secretAccessKey,
+        sessionToken: detail.sessionToken,
+      };
+      const blob = await encodeS3Card(payload, detail.passphrase);
+      this.#editor.insertAtCursor("```s3vault\n" + blob + "\n```\n");
+
+      // Activate immediately on this device — you just verified + created it.
+      await this.#activateS3Card(payload);
+
+      this.#s3CardCreateModal.hide();
+      this.#setStatus("ok", "Vault inserted");
+      getToast().show(`Inserted S3 vault for "${payload.displayName}" and granted this device access.`, "success", 5000);
+    } catch (err) {
+      console.error(err);
+      this.#s3CardCreateModal.setError((err as Error).message || "Failed to create vault.");
+    }
+  }
+
+  /** "Activate S3 vault" macro entry point: scans the CURRENT note's raw
+   *  text for ```s3vault fences (there's no rendered/clickable view for notes
+   *  today — see canvas's s3card-click for the one place that already works)
+   *  and opens the accept modal for the one found, or a picker if several. */
+  async #promptActivateS3Card(): Promise<void> {
+    if (!this.#editor || !this.#activePath) {
+      getToast().show("Open a note first.", "info", 3000);
+      return;
+    }
+    const text = this.#editor.value;
+    const blobs = [...text.matchAll(/```s3vault\s*\n([^\n`]+)\n```/g)].map((m) => m[1]!.trim());
+    if (blobs.length === 0) {
+      getToast().show("No S3 vaults found in this note.", "info", 3000);
+      return;
+    }
+    if (blobs.length === 1) {
+      this.#s3CardAcceptModal.setBlob(blobs[0]!);
+      this.#s3CardAcceptModal.show();
+      return;
+    }
+    const items = blobs.map((b, i) => ({ value: b, primary: `Vault ${i + 1}`, secondary: `${b.slice(0, 16)}…` }));
+    const chosen = await this.#switcher.pickItems(items, {
+      placeholder: "Pick a vault to activate…",
+      emptyHint: "No vaults",
+    });
+    if (!chosen) return;
+    this.#s3CardAcceptModal.setBlob(chosen);
+    this.#s3CardAcceptModal.show();
+  }
+
+  /** Handle a card click from a rendered view (currently: canvas text nodes only). */
+  #handleS3CardClick(blob: string): void {
+    this.#s3CardAcceptModal.setBlob(blob);
+    this.#s3CardAcceptModal.show();
+  }
+
+  async #handleS3CardAccept(payload: S3CardPayload): Promise<void> {
+    this.#s3CardAcceptModal.setBusy(true);
+    try {
+      const credential: S3Credential = {
+        version: 1,
+        accessKeyId: payload.accessKeyId,
+        secretAccessKey: payload.secretAccessKey,
+        sessionToken: payload.sessionToken,
+      };
+      const outcome = await runConnectionTest(payload.bucket, payload.region, credential);
+      if (!outcome.ok) {
+        this.#s3CardAcceptModal.setError(outcome.guidance ?? "Connection test failed.");
+        return;
+      }
+      await this.#activateS3Card(payload);
+      this.#s3CardAcceptModal.hide();
+      this.#setStatus("ok", "Access granted");
+      getToast().show(`Granted this device access to "${payload.displayName}".`, "success", 5000);
+    } catch (err) {
+      console.error(err);
+      this.#s3CardAcceptModal.setError((err as Error).message || "Failed to activate vault.");
+    } finally {
+      this.#s3CardAcceptModal.setBusy(false);
+    }
+  }
+
+  /** Cache a decrypted card locally (per-device, non-synced — see src/s3/activation.ts)
+   *  and open a worker session for it immediately. */
+  async #activateS3Card(payload: S3CardPayload): Promise<void> {
+    const cards = (await vaultService.getConfig<ActivatedS3Cards>(ACTIVATED_S3_CARDS_CONFIG_KEY)) ?? {};
+    const card: ActivatedS3Card = {
+      id: payload.id,
+      displayName: payload.displayName,
+      bucket: payload.bucket,
+      region: payload.region,
+      accessKeyId: payload.accessKeyId,
+      secretAccessKey: payload.secretAccessKey,
+      sessionToken: payload.sessionToken,
+      activatedAt: Date.now(),
+    };
+    cards[payload.id] = card;
+    await vaultService.setConfig(ACTIVATED_S3_CARDS_CONFIG_KEY, cards);
+
+    const credential: S3Credential = {
+      version: 1,
+      accessKeyId: card.accessKeyId,
+      secretAccessKey: card.secretAccessKey,
+      sessionToken: card.sessionToken,
+    };
+    const client = new S3CardClient(card.id);
+    await client.openSession(card.bucket, card.region, credential);
+    this.#s3Clients.set(card.id, client);
+    this.#s3SessionsOpen.add(card.id);
+
+    if (this.#vaults) this.#vaults.s3Cards = await this.#computeS3CardRows();
+  }
+
+  // ── S3 bucket browsing ───────────────────────────────────────────────────
+
+  /** Keeps the switcher's row highlight in sync with which card (if any) is
+   *  currently shown in the main pane — every #activeS3CardId assignment
+   *  should go through this rather than setting the field directly. */
+  #setActiveS3Card(cardId: string | null): void {
+    this.#activeS3CardId = cardId;
+    if (this.#vaults) this.#vaults.activeS3CardId = cardId;
+  }
+
+  /** Enter the browser for an activated card. Safe to call repeatedly (e.g.
+   *  on every route dispatch) — reuses an already-open worker session, and
+   *  serves the root listing from #s3RootCache if it was fetched within
+   *  S3_ROOT_CACHE_MS, so re-clicking the same bucket doesn't re-list on
+   *  every click. */
+  async #openS3Card(cardId: string): Promise<void> {
+    const cards = (await vaultService.getConfig<ActivatedS3Cards>(ACTIVATED_S3_CARDS_CONFIG_KEY)) ?? {};
+    const card = cards[cardId];
+    if (!card) {
+      getToast().show("That S3 vault hasn't been activated on this device.", "error", 4000);
+      navigateHome();
+      return;
+    }
+    this.#setActiveS3Card(cardId);
+    this.#s3Detail.setCard(card.displayName, card.bucket, card.region);
+    this.#s3Detail.reset();
+
+    const cached = this.#s3RootCache.get(cardId);
+    const isFresh = !!cached && Date.now() - cached.loadedAt < S3_ROOT_CACHE_MS;
+    if (isFresh) {
+      // Reset() above already cleared any OTHER bucket's leftover tree state;
+      // repopulate synchronously from cache — no network round-trip, no flash.
+      this.#s3Detail.setNode("", { entries: cached!.entries, continuationToken: cached!.continuationToken });
+    }
+
+    try {
+      await this.#ensureS3Session(card);
+    } catch (err) {
+      console.error(err);
+      this.#s3Detail.setNode("", { entries: [], error: (err as Error).message || "Failed to open bucket session." });
+      return;
+    }
+    if (!isFresh) {
+      await this.#loadS3Prefix(cardId, "");
+    }
+  }
+
+  /** Open (or reuse) this card's worker session using its locally-cached credential. */
+  async #ensureS3Session(card: ActivatedS3Card): Promise<S3CardClient> {
+    let client = this.#s3Clients.get(card.id);
+    if (!client) {
+      client = new S3CardClient(card.id);
+      this.#s3Clients.set(card.id, client);
+    }
+    if (!this.#s3SessionsOpen.has(card.id)) {
+      const credential: S3Credential = {
+        version: 1,
+        accessKeyId: card.accessKeyId,
+        secretAccessKey: card.secretAccessKey,
+        sessionToken: card.sessionToken,
+      };
+      await client.openSession(card.bucket, card.region, credential);
+      this.#s3SessionsOpen.add(card.id);
+    }
+    return client;
+  }
+
+  /** Fetches one level of a bucket's listing. For the root prefix, does NOT
+   *  clear the tree to a "loading" state first — whatever's already showing
+   *  (the previous listing, on a refresh) stays visible until the new data
+   *  arrives and atomically replaces it, instead of flashing to blank (a
+   *  genuinely first-time root load has nothing to show regardless, since
+   *  #reset() in #openS3Card already cleared it, so it falls back to the
+   *  tree's own "Loading…" state). A folder's first expand has no prior
+   *  content to preserve either way, so it still gets an explicit loading
+   *  placeholder — there's no other way for the tree to show one. */
+  async #loadS3Prefix(cardId: string, prefix: string, continuationToken?: string): Promise<void> {
+    const client = this.#s3Clients.get(cardId);
+    if (!client) return;
+    if (prefix !== "" && !continuationToken) {
+      this.#s3Detail.setNode(prefix, { entries: [], loading: true });
+    }
+    try {
+      const result = await client.list(prefix, continuationToken);
+      const rawEntries = (result["entries"] as Array<{ key: string; kind: "object" | "prefix"; size?: number; lastModified?: number }>) ?? [];
+      const entries: S3TreeEntry[] = rawEntries.map((e) => ({
+        key: e.key, kind: e.kind, size: e.size, lastModified: e.lastModified,
+      }));
+      const token = result["continuationToken"] as string | undefined;
+      if (continuationToken) {
+        this.#s3Detail.appendNode(prefix, entries, token);
+      } else {
+        this.#s3Detail.setNode(prefix, { entries, continuationToken: token });
+      }
+      if (prefix === "" && !continuationToken) {
+        this.#s3RootCache.set(cardId, { entries, continuationToken: token, loadedAt: Date.now() });
+      }
+    } catch (err) {
+      console.error(err);
+      this.#s3Detail.setNode(prefix, { entries: [], error: (err as Error).message || "Failed to list objects." });
+    }
+  }
+
+  /** View/download an object: fetch bytes, render via object URL (never
+   *  hotlink — most buckets are private and SigV4 auth can't ride a bare
+   *  <img src>). Images open inline in a new tab; everything else downloads. */
+  async #openS3Object(key: string): Promise<void> {
+    if (!this.#activeS3CardId) return;
+    const client = this.#s3Clients.get(this.#activeS3CardId);
+    if (!client) return;
+    try {
+      const result = await client.getObject(key);
+      const bytes = result["bytes"] as Uint8Array;
+      const contentType = result["contentType"] as string | undefined;
+      const blob = new Blob([bytes], contentType ? { type: contentType } : undefined);
+      const url = URL.createObjectURL(blob);
+      const name = key.split("/").pop() || key;
+      if (contentType?.startsWith("image/") || contentType === "application/pdf") {
+        window.open(url, "_blank");
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      } else {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      }
+    } catch (err) {
+      console.error(err);
+      getToast().show(`Couldn't open "${key}": ${(err as Error).message}`, "error", 5000);
+    }
+  }
+
+  /** S3 card rows for the vault switcher — cards activated on THIS device,
+   *  local config (see src/s3/activation.ts), independent of which vault is
+   *  currently open (a card could have been activated while viewing any
+   *  vault's notes). */
+  async #computeS3CardRows(): Promise<S3CardRow[]> {
+    const cards = (await vaultService.getConfig<ActivatedS3Cards>(ACTIVATED_S3_CARDS_CONFIG_KEY)) ?? {};
+    return Object.values(cards).filter(isActivatedS3Card).map((card) => ({ card }));
+  }
+
+  async #handleS3Upload(prefix: string, files: FileList): Promise<void> {
+    if (!this.#activeS3CardId) return;
+    const cardId = this.#activeS3CardId;
+    const client = this.#s3Clients.get(cardId);
+    if (!client) return;
+
+    for (const file of Array.from(files)) {
+      if (shouldWarnBeforeUpload(file.size)) {
+        const gb = (file.size / (1024 * 1024 * 1024)).toFixed(2);
+        if (!confirm(`"${file.name}" is ${gb} GB — upload it anyway?`)) continue;
+      }
+      const key = prefix + file.name;
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        this.#setStatus("syncing", `Uploading "${file.name}"…`);
+        await uploadObject(client, key, bytes, file.type || undefined, (p) => {
+          const pct = Math.round((p.bytesSent / p.bytesTotal) * 100);
+          this.#setStatus("syncing", `Uploading "${file.name}"… ${pct}%`);
+        });
+        getToast().show(`Uploaded "${file.name}".`, "success", 3000);
+      } catch (err) {
+        console.error(err);
+        getToast().show(`Failed to upload "${file.name}": ${(err as Error).message}`, "error", 5000);
+      }
+    }
+    this.#setStatus("ok", "Upload complete");
+    await this.#loadS3Prefix(cardId, prefix);
+  }
+
+  /** S3 has no real folders — this creates a zero-byte placeholder object
+   *  with a trailing-slash key, the same mechanism the AWS console uses,
+   *  so it shows up as a common prefix in the next listing. */
+  async #handleS3NewFolder(prefix: string): Promise<void> {
+    if (!this.#activeS3CardId) return;
+    const cardId = this.#activeS3CardId;
+    const client = this.#s3Clients.get(cardId);
+    if (!client) return;
+
+    const name = prompt("New folder name:");
+    if (!name) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (trimmed.includes("/")) {
+      getToast().show("Folder name can't contain \"/\" — create one level at a time.", "error", 4000);
+      return;
+    }
+
+    const key = `${prefix}${trimmed}/`;
+    try {
+      await client.putObject(key, new Uint8Array(0));
+      getToast().show(`Created folder "${trimmed}".`, "success", 3000);
+    } catch (err) {
+      console.error(err);
+      getToast().show(`Failed to create folder "${trimmed}": ${(err as Error).message}`, "error", 5000);
+      return;
+    }
+    await this.#loadS3Prefix(cardId, prefix);
+  }
+
+  async #handleS3Delete(key: string, kind: "object" | "prefix"): Promise<void> {
+    if (!this.#activeS3CardId) return;
+    const cardId = this.#activeS3CardId;
+    const client = this.#s3Clients.get(cardId);
+    if (!client) return;
+
+    if (kind === "object") {
+      const name = key.split("/").pop() || key;
+      const parentPrefix = key.slice(0, key.length - name.length);
+      if (!confirm(`Delete "${key}"? This cannot be undone.`)) return;
+      try {
+        await client.deleteObject(key);
+        getToast().show(`Deleted "${key}".`, "success", 3000);
+      } catch (err) {
+        console.error(err);
+        getToast().show(`Failed to delete "${key}": ${(err as Error).message}`, "error", 5000);
+        return;
+      }
+      await this.#loadS3Prefix(cardId, parentPrefix);
+      return;
+    }
+
+    // Folder delete — enumerate everything under the prefix first so the
+    // confirmation shows a real object count, then batch-delete.
+    const parentPrefix = key.replace(/\/+$/, "").split("/").slice(0, -1).join("/");
+    const parent = parentPrefix ? parentPrefix + "/" : "";
+    this.#setStatus("syncing", `Scanning "${key}"…`);
+    let all: { key: string; size: number }[];
+    try {
+      all = await client.listAllUnderPrefix(key);
+    } catch (err) {
+      console.error(err);
+      getToast().show(`Failed to scan "${key}": ${(err as Error).message}`, "error", 5000);
+      this.#setStatus("error", "Scan failed");
+      return;
+    }
+    if (all.length === 0) {
+      getToast().show(`"${key}" is already empty.`, "info", 3000);
+      await this.#loadS3Prefix(cardId, parent);
+      return;
+    }
+    const plural = all.length === 1 ? "" : "s";
+    if (!confirm(`Delete "${key}" and everything inside it — ${all.length} object${plural}? This cannot be undone.`)) {
+      return;
+    }
+    try {
+      const batches = batchKeysForDelete(all.map((o) => o.key));
+      let done = 0;
+      for (const batch of batches) {
+        await client.deleteObjects(batch);
+        done += batch.length;
+        this.#setStatus("syncing", `Deleting… ${done}/${all.length}`);
+      }
+      getToast().show(`Deleted "${key}" (${all.length} object${plural}).`, "success", 4000);
+      this.#setStatus("ok", "Deleted");
+    } catch (err) {
+      console.error(err);
+      getToast().show(`Delete failed partway through: ${(err as Error).message}`, "error", 6000);
+      this.#setStatus("error", "Delete failed");
+    }
+    await this.#loadS3Prefix(cardId, parent);
+  }
+
+  async #handleS3Rename(key: string, kind: "object" | "prefix", size: number | undefined): Promise<void> {
+    if (!this.#activeS3CardId) return;
+    const cardId = this.#activeS3CardId;
+    const client = this.#s3Clients.get(cardId);
+    if (!client) return;
+
+    if (kind === "object") {
+      const currentName = key.split("/").pop() || key;
+      const parentPrefix = key.slice(0, key.length - currentName.length);
+      const next = prompt(`Rename "${currentName}" to:`, currentName);
+      if (!next) return;
+      const trimmed = next.trim();
+      if (!trimmed || trimmed === currentName) return;
+      const newKey = parentPrefix + trimmed;
+      this.#setStatus("syncing", `Renaming "${currentName}"…`);
+      try {
+        await moveObject(client, key, newKey, size ?? 0);
+        getToast().show(`Renamed to "${trimmed}".`, "success", 3000);
+        this.#setStatus("ok", "Renamed");
+      } catch (err) {
+        console.error(err);
+        getToast().show(`Rename failed: ${(err as Error).message}`, "error", 5000);
+        this.#setStatus("error", "Rename failed");
+      }
+      await this.#loadS3Prefix(cardId, parentPrefix);
+      return;
+    }
+
+    // Folder rename — enumerate, confirm with count, copy everything to the
+    // new prefix, and only delete the OLD objects after every copy succeeds.
+    const trimmedKey = key.replace(/\/+$/, "");
+    const currentFolderName = trimmedKey.split("/").pop() || trimmedKey;
+    const parentOfFolder = trimmedKey.slice(0, trimmedKey.length - currentFolderName.length);
+    const next = prompt(`Rename folder "${currentFolderName}" to:`, currentFolderName);
+    if (!next) return;
+    const trimmed = next.trim();
+    if (!trimmed || trimmed === currentFolderName) return;
+    const newPrefix = parentOfFolder + trimmed + "/";
+
+    this.#setStatus("syncing", `Scanning "${key}"…`);
+    let all: { key: string; size: number }[];
+    try {
+      all = await client.listAllUnderPrefix(key);
+    } catch (err) {
+      console.error(err);
+      getToast().show(`Failed to scan "${key}": ${(err as Error).message}`, "error", 5000);
+      this.#setStatus("error", "Scan failed");
+      return;
+    }
+    const plural = all.length === 1 ? "" : "s";
+    if (!confirm(`Rename "${key}" to "${newPrefix}" — ${all.length} object${plural}?`)) return;
+
+    const plan = buildCopyPlan(all.map((o) => o.key), key, newPrefix);
+    const sizeByKey = new Map(all.map((o) => [o.key, o.size]));
+    try {
+      let done = 0;
+      for (const { from, to } of plan) {
+        await copyObjectSizeAware(client, from, to, sizeByKey.get(from) ?? 0);
+        done += 1;
+        this.#setStatus("syncing", `Renaming… ${done}/${plan.length}`);
+      }
+      const batches = batchKeysForDelete(plan.map((p) => p.from));
+      for (const batch of batches) {
+        await client.deleteObjects(batch);
+      }
+      getToast().show(`Renamed "${key}" to "${newPrefix}" (${all.length} object${plural}).`, "success", 4000);
+      this.#setStatus("ok", "Renamed");
+    } catch (err) {
+      console.error(err);
+      getToast().show(
+        `Rename failed partway through — some files may now exist at both the old and new location: ${(err as Error).message}`,
+        "error", 8000
+      );
+      this.#setStatus("error", "Rename failed");
+    }
+    await this.#loadS3Prefix(cardId, parentOfFolder);
+  }
+
   // ── Vault event wiring ────────────────────────────────────────────────────
 
   #wireVaultEvents(): void {
@@ -2079,6 +2731,7 @@ export class LSApp extends HTMLElement {
       this.#selectedVaultId = multiplexer.currentVaultId ?? vaults[0]?.id ?? null;
     }
     this.#vaults.selectedId = this.#selectedVaultId;
+    this.#vaults.s3Cards = await this.#computeS3CardRows();
     await this.#refreshVaultDetail();
   }
 
@@ -2113,6 +2766,10 @@ export class LSApp extends HTMLElement {
       lockedZoneCount: isCurrent && current
         ? current.listZones().filter((z) => !current.isZoneUnlocked(z.id)).length
         : 0,
+      // Activated cards are device-local, not vault-scoped — same count
+      // regardless of which vault is displayed. Reuses whatever the switcher
+      // last computed rather than re-reading config here.
+      s3CardCount: this.#vaults?.s3Cards.length ?? 0,
     };
     this.#vaultDetail.setSnapshot(snapshot);
   }
@@ -2229,6 +2886,24 @@ export class LSApp extends HTMLElement {
       // Drill into Files by default — after opening a vault the user expects
       // to see their notes, not the vault picker.
       this.#drillInto("files");
+      return;
+    }
+    if (route.type === "s3") {
+      if (multiplexer.currentVaultId !== route.vaultId) {
+        try { await multiplexer.open(route.vaultId); }
+        catch (err) {
+          console.error("[route] failed to open vault", route.vaultId, err);
+          getToast().show(`Could not open vault: ${(err as Error).message ?? err}`, "error", 5000);
+          navigateToVaults();
+          return;
+        }
+      }
+      this.#activePath = "";
+      this.#setSidebarPanelsVisible(false);
+      this.#outline.headings = [];
+      this.#backlinks.links = [];
+      this.#conflictBanner.classList.remove("visible");
+      this.#drillIntoS3(route.cardId);
       return;
     }
     // route.type === "note"
@@ -2669,6 +3344,8 @@ export class LSApp extends HTMLElement {
     this.#palette.register({ id: "force-push", label: "Force push to remote (overwrite remote changes)", description: "Push local state to GitHub, discarding any commits that aren't in your local copy", category: "vault" });
     this.#palette.register({ id: "lock-all", label: "Lock all folders", description: "Drop every encryption zone identity from memory", category: "vault" });
     this.#palette.register({ id: "list-zones", label: "List encryption zones", description: "Show every encrypted folder, its algorithm, and whether it's unlocked", category: "vault" });
+    this.#palette.register({ id: "insert-s3-card", label: "Insert S3 vault…", description: "Embed an encrypted S3 bucket credential vault in the current note", category: "file" });
+    this.#palette.register({ id: "activate-s3-card", label: "Activate S3 vault", description: "Grant this device access to an S3 vault in the current note", category: "file" });
 
     // Commands category panel mirrors the palette contents.
     this.#populateCommandsPanel();
@@ -2816,6 +3493,12 @@ export class LSApp extends HTMLElement {
         break;
       case "lock-folder":
         target ? this.#lockFolderAt(target.path) : this.#promptLockFolder().catch(console.error);
+        break;
+      case "insert-s3-card":
+        this.#promptInsertS3Card();
+        break;
+      case "activate-s3-card":
+        this.#promptActivateS3Card().catch(console.error);
         break;
       case "lock-all":
         vaultService.lockAll();

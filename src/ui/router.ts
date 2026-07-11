@@ -4,6 +4,7 @@
 //   #/vaults                         — vault list / empty state
 //   #/v/<vaultId>                    — current vault home
 //   #/v/<vaultId>/note/<encoded>     — note inside a vault
+//   #/v/<vaultId>/s3/<cardId>/<encoded prefix>  — S3 bucket browser
 //   #                                 — legacy home (redirect to current vault on route dispatch)
 //
 // Dispatches a "route" CustomEvent on window with { detail: Route }.
@@ -13,31 +14,53 @@ export type Route =
   | { type: "vaults" }
   | { type: "vault"; vaultId: string }
   | { type: "note"; vaultId: string; path: string }
+  | { type: "s3"; vaultId: string; cardId: string; prefix: string }
   | { type: "share"; blob: string };
 
 export function currentRoute(): Route {
   return parseHash(location.hash);
 }
 
+// Setting `location.hash` to its CURRENT value is a no-op in browsers — no
+// hashchange event fires. Every navigate* function below must therefore
+// dispatch the route explicitly rather than relying solely on hashchange,
+// or re-navigating to an already-active route (e.g. clicking the same S3
+// bucket entry twice, or reloading on a route that was already active from
+// a previous session) silently does nothing.
+function setHashAndEmit(hash: string): void {
+  const changed = location.hash !== `#${hash}`;
+  location.hash = hash;
+  if (!changed) emitRoute();
+}
+
+function emitRoute(): void {
+  window.dispatchEvent(new CustomEvent("route", { detail: currentRoute(), bubbles: false }));
+}
+
 /** Navigate to a note within a given vault. */
 export function navigateToNote(vaultId: string, path: string): void {
-  location.hash = `/v/${encodeURIComponent(vaultId)}/note/${encodeURIComponent(path)}`;
+  setHashAndEmit(`/v/${encodeURIComponent(vaultId)}/note/${encodeURIComponent(path)}`);
 }
 
 /** Navigate to a vault's home (no active note). */
 export function navigateToVault(vaultId: string): void {
-  location.hash = `/v/${encodeURIComponent(vaultId)}`;
+  setHashAndEmit(`/v/${encodeURIComponent(vaultId)}`);
+}
+
+/** Navigate to an activated S3 card's bucket browser, optionally at a nested prefix. */
+export function navigateToS3(vaultId: string, cardId: string, prefix = ""): void {
+  setHashAndEmit(`/v/${encodeURIComponent(vaultId)}/s3/${encodeURIComponent(cardId)}/${encodeURIComponent(prefix)}`);
 }
 
 /** Navigate to the top-level Vaults list. */
 export function navigateToVaults(): void {
-  location.hash = "/vaults";
+  setHashAndEmit("/vaults");
 }
 
 /** Navigate to a share-link route. Mostly useful for testing — recipients
  *  arrive at this route organically from a link outside the app. */
 export function navigateToShare(blob: string): void {
-  location.hash = `/share/${encodeURIComponent(blob)}`;
+  setHashAndEmit(`/share/${encodeURIComponent(blob)}`);
 }
 
 // Router-side view of "current vault." Populated by the multiplexer on
@@ -95,6 +118,20 @@ function parseHash(hash: string): Route {
       try { return { type: "note", vaultId, path: decodeURIComponent(encoded) }; }
       catch { return { type: "vault", vaultId }; }
     }
+    if (afterId.startsWith("s3/")) {
+      const rest2 = afterId.slice(3);
+      const slash2 = rest2.indexOf("/");
+      try {
+        if (slash2 === -1) {
+          return { type: "s3", vaultId, cardId: decodeURIComponent(rest2), prefix: "" };
+        }
+        const cardId = decodeURIComponent(rest2.slice(0, slash2));
+        const prefix = decodeURIComponent(rest2.slice(slash2 + 1));
+        return { type: "s3", vaultId, cardId, prefix };
+      } catch {
+        return { type: "vault", vaultId };
+      }
+    }
     return { type: "vault", vaultId };
   }
   // Anything else — including legacy `#/note/…` — treated as home and resolved
@@ -102,8 +139,4 @@ function parseHash(hash: string): Route {
   return { type: "home" };
 }
 
-window.addEventListener("hashchange", () => {
-  window.dispatchEvent(
-    new CustomEvent("route", { detail: currentRoute(), bubbles: false })
-  );
-});
+window.addEventListener("hashchange", emitRoute);

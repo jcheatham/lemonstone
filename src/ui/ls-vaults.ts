@@ -2,13 +2,20 @@
 //
 // Contains a vault list + a footer "+ Add vault" action. Clicking a row
 // fires `vault-select` (not `vault-switch`) — the main pane's detail card
-// then displays actions for the selected vault.
+// then displays actions for the selected vault. Below the vault list, S3
+// vaults activated ON THIS DEVICE render as their own labeled
+// sub-section — navigationally they behave like a vault (their own entry,
+// own detail view) even though there's no repo of their own; the S3 vault
+// itself (an encrypted blob embedded in a note) is what's portable/synced,
+// this list is just local activation state (see src/s3/activation.ts).
 //
 // Events (bubbles, composed):
-//   vault-select — detail: { vaultId }
-//   vault-add    — user asked to add a new vault
+//   vault-select   — detail: { vaultId }
+//   vault-add      — user asked to add a new vault
+//   s3-card-select — detail: { cardId }
 
 import type { VaultRecord } from "../vault/manifest.ts";
+import type { ActivatedS3Card } from "../s3/activation.ts";
 
 const style = `
   :host { display: flex; flex-direction: column; height: 100%; overflow: hidden; font-size: 13px; }
@@ -80,13 +87,36 @@ const style = `
     background: var(--ls-color-accent, #7c6af7);
     flex-shrink: 0;
   }
+  .s3-header {
+    padding: 12px 12px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ls-color-fg-muted, #64748b);
+  }
+  .s3-row .label { display: flex; align-items: center; gap: 6px; }
+  .s3-row .bucket {
+    font-size: 11px;
+    color: var(--ls-color-fg-muted, #64748b);
+    font-family: var(--ls-font-mono, monospace);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 `;
+
+export interface S3CardRow {
+  card: ActivatedS3Card;
+}
 
 export class LSVaults extends HTMLElement {
   #shadow: ShadowRoot;
   #vaults: VaultRecord[] = [];
   #currentId: string | null = null;
   #selectedId: string | null = null;
+  #s3Cards: S3CardRow[] = [];
+  #activeS3CardId: string | null = null;
 
   constructor() {
     super();
@@ -105,9 +135,20 @@ export class LSVaults extends HTMLElement {
   set currentId(v: string | null) { this.#currentId = v; this.#render(); }
 
   /** UI selection (not "current vault"). Drives which row is highlighted
-   *  and which vault the main pane's detail card shows. */
+   *  and which vault the main pane's detail card shows. Only reflected in
+   *  the row highlight while no S3 card is active (see activeS3CardId) —
+   *  the two are mutually exclusive since only one main-pane view shows at once. */
   get selectedId(): string | null { return this.#selectedId; }
   set selectedId(v: string | null) { this.#selectedId = v; this.#render(); }
+
+  /** S3 vaults activated on this device (see src/s3/activation.ts). */
+  get s3Cards(): S3CardRow[] { return this.#s3Cards; }
+  set s3Cards(v: S3CardRow[]) { this.#s3Cards = v; this.#render(); }
+
+  /** Which S3 card (if any) is currently shown in the main pane — drives
+   *  its row highlight, mutually exclusive with the git-vault selection. */
+  get activeS3CardId(): string | null { return this.#activeS3CardId; }
+  set activeS3CardId(v: string | null) { this.#activeS3CardId = v; this.#render(); }
 
   #render(): void {
     const root = this.#shadow;
@@ -140,12 +181,42 @@ export class LSVaults extends HTMLElement {
       for (const v of this.#vaults) list.appendChild(this.#row(v));
     }
 
+    if (this.#s3Cards.length > 0) {
+      const s3Header = document.createElement("div");
+      s3Header.className = "s3-header";
+      s3Header.textContent = "S3 vaults";
+      list.appendChild(s3Header);
+      for (const row of this.#s3Cards) list.appendChild(this.#s3Row(row));
+    }
+
     root.appendChild(list);
+  }
+
+  #s3Row(row: S3CardRow): HTMLElement {
+    const el = document.createElement("div");
+    el.className = "row s3-row" + (row.card.id === this.#activeS3CardId ? " selected" : "");
+    el.addEventListener("click", () => {
+      this.dispatchEvent(new CustomEvent("s3-card-select", {
+        bubbles: true, composed: true, detail: { cardId: row.card.id },
+      }));
+    });
+
+    const labelWrap = document.createElement("div");
+    labelWrap.className = "label-wrap";
+    const label = document.createElement("div");
+    label.className = "label";
+    label.textContent = "🪣 " + row.card.displayName;
+    const bucket = document.createElement("div");
+    bucket.className = "bucket";
+    bucket.textContent = `${row.card.bucket} · ${row.card.region}`;
+    labelWrap.append(label, bucket);
+    el.appendChild(labelWrap);
+    return el;
   }
 
   #row(v: VaultRecord): HTMLElement {
     const row = document.createElement("div");
-    row.className = "row" + (v.id === this.#selectedId ? " selected" : "");
+    row.className = "row" + (v.id === this.#selectedId && !this.#activeS3CardId ? " selected" : "");
     row.addEventListener("click", () => {
       this.#selectedId = v.id;
       this.#render();

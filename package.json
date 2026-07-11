@@ -24,6 +24,7 @@
     "workbox-cli": "^7.4.0"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1084.0",
     "@codemirror/commands": "^6.10.3",
     "@codemirror/lang-html": "^6.4.11",
     "@codemirror/lang-markdown": "^6.5.0",
@@ -31,6 +32,7 @@
     "@codemirror/state": "^6.6.0",
     "@codemirror/view": "^6.41.1",
     "@isomorphic-git/lightning-fs": "^4.6.2",
+    "@xmldom/xmldom": "^0.9.10",
     "age-encryption": "^0.3.0",
     "codemirror": "^6.0.2",
     "idb": "^8.0.3",

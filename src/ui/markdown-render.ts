@@ -16,6 +16,20 @@ marked.setOptions({
   breaks: true,
 });
 
+// ```s3vault fenced blocks hold an opaque, passphrase-encrypted blob (see
+// src/s3/card.ts) — render a locked card widget instead of a code block.
+// Nothing about the card (not even the bucket name) is visible pre-decrypt,
+// matching the share-link's all-or-nothing model. Returning `false` falls
+// through to the default code-block renderer for every other language.
+marked.use({
+  renderer: {
+    code({ text, lang }) {
+      if (lang !== "s3vault") return false;
+      return `<div class="s3vault-card" data-blob="${escapeAttr(text.trim())}">🔒 S3 vault — click to grant access</div>`;
+    },
+  },
+});
+
 const WIKILINK_RE = /\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g;
 
 /** Convert markdown to HTML. Wikilinks become `<a class="wikilink" data-target="name">label</a>`. */
