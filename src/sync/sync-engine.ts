@@ -548,6 +548,14 @@ export class SyncEngine {
         // abortOnConflict defaults to true — if conflicts exist, it throws
         // MergeConflictError without corrupting the index.
       });
+      // git.merge() only updates the branch ref + object database — it never
+      // touches the working directory OR the git index. Without this checkout,
+      // OPFS and the index silently drift from HEAD after every fast-forward:
+      // the next local commit builds its tree from the stale index and would
+      // omit any files that arrived in this merge, which is exactly what trips
+      // the unsafe-push safety net (#detectUnexpectedDrops) as soon as the
+      // user's next edit tries to sync.
+      await git.checkout({ fs: this.fs, dir: GIT_DIR, ref: branch, force: true });
       // Clean merge — pull updated files into IndexedDB.
       await this.reconcileFromOPFS();
     } catch (err) {
